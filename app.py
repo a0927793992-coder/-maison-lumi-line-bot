@@ -828,26 +828,100 @@ def normalize_spec(spec):
 
 
 def parse_order_text(text):
+    """
+    規格完全由客人輸入內容自動抓，不需要事先設定。
+
+    支援：
+      +1
+      包包+1
+      玲娜+1
+      包包+1 玲娜+1
+      包包+1、玲娜+1
+      包包+1
+      玲娜+2
+
+    規則：
+      「+數量」前面的文字 = 規格名稱
+
+    回傳：
+      ("ADD", [("包包", 1), ("玲娜", 1)])
+      ("CANCEL_ALL", [])
+      ("CANCEL_SPEC", [("玲娜", None)])
+    """
     text = (text or "").strip()
 
-    m = PLUS_ONLY_RE.match(text)
-    if m:
-        qty = int(m.group(1))
-        return ("ADD", "單一規格", qty)
+    if not text:
+        return None
 
-    m = SPEC_PLUS_RE.match(text)
-    if m:
-        spec = normalize_spec(m.group(1))
-        qty = int(m.group(2))
-        return ("ADD", spec, qty)
+    # 統一全形符號
+    normalized_text = (
+        text.replace("＋", "+")
+            .replace("，", " ")
+            .replace(",", " ")
+            .replace("、", " ")
+            .replace("；", " ")
+            .replace(";", " ")
+            .replace("|", " ")
+    )
 
-    m = CANCEL_ONLY_RE.match(text)
-    if m:
-        return ("CANCEL_ALL", None, None)
+    # 取消全部
+    if CANCEL_ONLY_RE.fullmatch(normalized_text.strip()):
+        return ("CANCEL_ALL", [])
 
-    m = SPEC_CANCEL_RE.match(text)
-    if m:
-        return ("CANCEL_SPEC", normalize_spec(m.group(1)), None)
+    # 單一規格取消，例如：玲娜取消
+    cancel_match = SPEC_CANCEL_RE.fullmatch(normalized_text.strip())
+    if cancel_match:
+        return (
+            "CANCEL_SPEC",
+            [(normalize_spec(cancel_match.group(1)), None)],
+        )
+
+    # 純 +1 / +2 = 單一規格
+    plus_only = PLUS_ONLY_RE.fullmatch(normalized_text.strip())
+    if plus_only:
+        qty = int(plus_only.group(1))
+        if 1 <= qty <= 99:
+            return ("ADD", [("單一規格", qty)])
+        return None
+
+    # 動態抓規格：
+    # 每一段「任意文字 + 數量」都視為一個規格
+    # 例如：包包+1 玲娜+1
+    #
+    # 利用 lookahead 停在下一個規格前，避免把「玲娜」黏到上一個規格。
+    item_re = re.compile(
+        r"(?:^|[\s\n\r]+)"
+        r"(.+?)"
+        r"\s*\+\s*(\d+)"
+        r"(?=$|[\s\n\r]+)"
+    )
+
+    # 為了讓「包包+1、玲娜+1」先變成空白分隔
+    scan_text = re.sub(r"\s+", " ", normalized_text).strip()
+    scan_text = " " + scan_text + " "
+
+    items = []
+
+    for match in item_re.finditer(scan_text):
+        spec = normalize_spec(match.group(1).strip())
+        qty = int(match.group(2))
+
+        if spec and 1 <= qty <= 99:
+            items.append((spec, qty))
+
+    # 備援：處理完全無空格黏在一起的簡單格式，例如 包包+1玲娜+1
+    if not items:
+        compact_re = re.compile(
+            r"([^+\d][^+]*?)\s*\+\s*(\d+)"
+        )
+        for match in compact_re.finditer(normalized_text):
+            spec = normalize_spec(match.group(1).strip())
+            qty = int(match.group(2))
+            if spec and 1 <= qty <= 99:
+                items.append((spec, qty))
+
+    if items:
+        return ("ADD", items)
 
     return None
 
@@ -1314,7 +1388,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "10-place-date-session-input",
+        "version": "12-dynamic-spec-unsend-safe",
     })
 
 
@@ -1362,6 +1436,12 @@ def webhook():
 
     for event in body.get("events", []):
         event_type = event.get("type")
+
+        # 客人收回 LINE 訊息時，LINE 會送 unsend 事件。
+        # 這裡刻意忽略：已成立的喊單不會因收回訊息而刪除。
+        if event_type == "unsend":
+            continue
+
         source = event.get("source", {})
         source_type = source.get("type")
         user_id = source.get("userId")
@@ -1698,28 +1778,28 @@ def webhook():
             quoted_message_id
         )
 
+        created_now = False
+        action, items = parsed
+
         # First valid +1 / 規格+1 creates the product.
         if not product:
             if not pending:
                 continue
 
-            action, spec_name, qty = parsed
-
             # Cancel cannot create a product.
-            if action != "ADD":
+            if action != "ADD" or not items:
                 continue
 
             product, error = create_product_from_pending(
                 pending
             )
 
+            if not error:
+                created_now = True
+
             if error == "NO_ACTIVE_SESSION":
                 # Keep group quiet; no product is created.
                 continue
-
-            notify_owner_product_created(
-                product
-            )
 
         # After session ends, existing product remains queryable,
         # but closed products refuse more orders.
@@ -1736,16 +1816,24 @@ def webhook():
             or user_id
         )
 
-        action, spec_name, qty = parsed
-
         if action == "ADD":
-            if 1 <= qty <= 99:
-                add_order_item(
-                    product["id"],
-                    user_id,
-                    display_name,
-                    spec_name,
-                    qty,
+            for spec_name, qty in items:
+                if 1 <= qty <= 99:
+                    add_order_item(
+                        product["id"],
+                        user_id,
+                        display_name,
+                        spec_name,
+                        qty,
+                    )
+
+            # 建立商品後再通知 Owner，第一筆規格會直接顯示在卡片裡。
+            if created_now:
+                product = get_product_by_image(
+                    quoted_message_id
+                )
+                notify_owner_product_created(
+                    product
                 )
 
             # Group remains completely silent.
@@ -1759,11 +1847,12 @@ def webhook():
             continue
 
         if action == "CANCEL_SPEC":
-            cancel_user_spec(
-                product["id"],
-                user_id,
-                spec_name,
-            )
+            for spec_name, _ in items:
+                cancel_user_spec(
+                    product["id"],
+                    user_id,
+                    spec_name,
+                )
             continue
 
     return "OK"
