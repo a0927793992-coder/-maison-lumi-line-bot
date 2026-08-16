@@ -25,7 +25,18 @@ CANCEL_ONLY_RE = re.compile(r"^\s*(取消|刪單|cancel)\s*$", re.IGNORECASE)
 SPEC_CANCEL_RE = re.compile(r"^\s*(.+?)\s*(取消|刪單)\s*$", re.IGNORECASE)
 ADMIN_QUERY_RE = re.compile(r"^\s*(.+?[A-Z]\d{3,})\s*(查單|結單)\s*$", re.IGNORECASE)
 START_SESSION_RE = re.compile(r"^\s*開始連線\s*(.+?)\s*$")
-AUTO_SESSION_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}(?:\s*[-~～至]\s*(?:\d{1,2}/)?\d{1,2})?\s*\S.+?\s*$")
+AUTO_SESSION_DATE_FIRST_RE = re.compile(
+    r"^\s*\d{1,2}/\d{1,2}"
+    r"(?:\s*[-~～至]\s*(?:\d{1,2}/)?\d{1,2})?"
+    r"\s*[^\d/].+?\s*$"
+)
+
+AUTO_SESSION_PLACE_FIRST_RE = re.compile(
+    r"^\s*[^\d/].*?"
+    r"\d{1,2}/\d{1,2}"
+    r"(?:\s*[-~～至]\s*(?:\d{1,2}/)?\d{1,2})?"
+    r"\s*$"
+)
 END_SESSION_RE = re.compile(r"^\s*結束連線(?:\s+(.+?))?\s*$")
 JOIN_STAFF_RE = re.compile(r"^\s*加入小幫手\s+(\d{6})\s*$")
 PRODUCT_LIST_RE = re.compile(r"^\s*(商品列表|商品清單)\s*$")
@@ -416,35 +427,54 @@ def fetch_line_image(message_id):
 # ---------- Sessions ----------
 
 def clean_session_code(text):
+    """
+    Accepts:
+      香港8/18
+      香港 8/18
+      8/18香港
+      8/18 香港
+      香港8/18-19
+      8/18-19 香港
+      東京10/19
+    Produces:
+      0818香港連線
+      081819香港連線
+      1019東京連線
+    """
     text = text.strip()
 
-    # Example: 8/18-19 香港 -> 081819香港連線
-    m = re.match(
-        r"^\s*(\d{1,2})/(\d{1,2})(?:\s*[-~～至]\s*(?:(\d{1,2})/)?(\d{1,2}))?\s*(.*)$",
-        text,
+    date_re = re.compile(
+        r"(?P<m1>\d{1,2})/(?P<d1>\d{1,2})"
+        r"(?:\s*[-~～至]\s*(?:(?P<m2>\d{1,2})/)?(?P<d2>\d{1,2}))?"
     )
 
-    if m:
-        month1 = int(m.group(1))
-        day1 = int(m.group(2))
-        month2 = int(m.group(3)) if m.group(3) else month1
-        day2 = int(m.group(4)) if m.group(4) else None
-        place = (m.group(5) or "").strip().replace(" ", "")
+    m = date_re.search(text)
 
-        date_code = f"{month1:02d}{day1:02d}"
+    if not m:
+        compact = re.sub(r"\s+", "", text)
+        return compact if compact.endswith("連線") else compact + "連線"
 
-        if day2 is not None:
-            if month2 == month1:
-                date_code += f"{day2:02d}"
-            else:
-                date_code += f"{month2:02d}{day2:02d}"
+    month1 = int(m.group("m1"))
+    day1 = int(m.group("d1"))
+    month2 = int(m.group("m2")) if m.group("m2") else month1
+    day2 = int(m.group("d2")) if m.group("d2") else None
 
-        return f"{date_code}{place}連線"
+    before = text[:m.start()].strip()
+    after = text[m.end():].strip()
+    place = re.sub(r"\s+", "", f"{before}{after}")
 
-    compact = re.sub(r"\s+", "", text)
-    if compact.endswith("連線"):
-        return compact
-    return compact + "連線"
+    # Remove accidental command text if explicit syntax is used.
+    place = re.sub(r"^開始連線", "", place).strip()
+
+    date_code = f"{month1:02d}{day1:02d}"
+
+    if day2 is not None:
+        if month2 == month1:
+            date_code += f"{day2:02d}"
+        else:
+            date_code += f"{month2:02d}{day2:02d}"
+
+    return f"{date_code}{place}連線"
 
 
 def start_session(name):
@@ -1284,7 +1314,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "9-flexible-session-input",
+        "version": "10-place-date-session-input",
     })
 
 
@@ -1484,9 +1514,10 @@ def webhook():
                 continue
 
             start_match = START_SESSION_RE.match(text)
-            auto_start_match = AUTO_SESSION_RE.match(text)
+            auto_date_first = AUTO_SESSION_DATE_FIRST_RE.match(text)
+            auto_place_first = AUTO_SESSION_PLACE_FIRST_RE.match(text)
 
-            if start_match or auto_start_match:
+            if start_match or auto_date_first or auto_place_first:
                 if not is_owner(user_id):
                     continue
 
@@ -1601,7 +1632,9 @@ def webhook():
                 reply_text(
                     reply_token,
                     "Owner 指令：\n"
-                    "8/18-19 香港\n"
+                    "香港8/18\n"
+                    "東京10/19\n"
+                    "香港8/18-19\n"
                     "或：開始連線 8/18-19 香港\n"
                     "結束連線\n"
                     "商品列表\n"
