@@ -24,8 +24,8 @@ SPEC_PLUS_RE = re.compile(r"^\s*(.+?)\s*\+(\d+)\s*$")
 CANCEL_ONLY_RE = re.compile(r"^\s*(取消|刪單|cancel)\s*$", re.IGNORECASE)
 SPEC_CANCEL_RE = re.compile(r"^\s*(.+?)\s*(取消|刪單)\s*$", re.IGNORECASE)
 ADMIN_QUERY_RE = re.compile(r"^\s*(.+?[A-Z]\d{3,})\s*(查單|結單)\s*$", re.IGNORECASE)
-START_SESSION_RE = re.compile(r"^\s*開始連線\s+(.+?)\s*$")
-AUTO_SESSION_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}(?:\s*[-~～至]\s*(?:\d{1,2}/)?\d{1,2})?\s*.+?\s*$")
+START_SESSION_RE = re.compile(r"^\s*開始連線\s*(.+?)\s*$")
+AUTO_SESSION_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}(?:\s*[-~～至]\s*(?:\d{1,2}/)?\d{1,2})?\s*\S.+?\s*$")
 END_SESSION_RE = re.compile(r"^\s*結束連線(?:\s+(.+?))?\s*$")
 JOIN_STAFF_RE = re.compile(r"^\s*加入小幫手\s+(\d{6})\s*$")
 PRODUCT_LIST_RE = re.compile(r"^\s*(商品列表|商品清單)\s*$")
@@ -1284,7 +1284,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "8-auto-session-date",
+        "version": "9-flexible-session-input",
     })
 
 
