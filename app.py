@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 import string
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from flask import Flask, request, abort, jsonify, Response
@@ -18,6 +18,12 @@ CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "maison_lumi.db")
 ADMIN_USER_ID_ENV = os.getenv("ADMIN_USER_ID", "").strip()
+
+# ---------- Anti-raid / mass-leave alert ----------
+LEAVE_ALERT_WINDOW_SECONDS = 30
+LEAVE_ALERT_THRESHOLD = 2
+LEAVE_ALERT_COOLDOWN_SECONDS = 30
+TAIPEI_TZ = timezone(timedelta(hours=8))
 
 PLUS_ONLY_RE = re.compile(r"^\s*\+(\d+)\s*$")
 SPEC_PLUS_RE = re.compile(r"^\s*(.+?)\s*\+(\d+)\s*$")
@@ -135,6 +141,25 @@ def init_db():
             updated_at TEXT NOT NULL,
             UNIQUE(product_id, user_id, spec_name),
             FOREIGN KEY(product_id) REFERENCES products(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS group_leave_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            user_id TEXT,
+            webhook_event_id TEXT,
+            occurred_at_ms INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(webhook_event_id, user_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_group_leave_events_group_time
+        ON group_leave_events(group_id, occurred_at_ms);
+
+        CREATE TABLE IF NOT EXISTS leave_alert_state (
+            group_id TEXT PRIMARY KEY,
+            last_alert_at_ms INTEGER NOT NULL,
+            last_alert_count INTEGER NOT NULL DEFAULT 0
         );
         """)
 
@@ -399,6 +424,206 @@ def get_group_profile(group_id, user_id):
         "displayName": user_id or "未知會員",
         "pictureUrl": None,
     }
+
+
+def get_group_summary(group_id):
+    if not CHANNEL_ACCESS_TOKEN or not group_id:
+        return None
+
+    try:
+        r = requests.get(
+            f"https://api.line.me/v2/bot/group/{group_id}/summary",
+            headers=auth_headers(),
+            timeout=10,
+        )
+        if r.ok:
+            return r.json()
+    except requests.RequestException:
+        pass
+
+    return None
+
+
+def _format_taipei_time(timestamp_ms):
+    try:
+        dt = datetime.fromtimestamp(
+            timestamp_ms / 1000,
+            tz=timezone.utc,
+        ).astimezone(TAIPEI_TZ)
+    except (TypeError, ValueError, OSError):
+        dt = datetime.now(TAIPEI_TZ)
+
+    return dt.strftime("%Y/%m/%d %H:%M:%S")
+
+
+def record_member_left_and_maybe_alert(event):
+    """
+    LINE memberLeft webhook:
+      event["source"]["groupId"]
+      event["left"]["members"]
+
+    Rule:
+      - Same group
+      - Rolling 30-second window
+      - 2 or more members leave => immediately push a private alert to Owner
+      - Never send anything to the customer group
+      - At most one alert per group every 30 seconds to avoid alert spam
+      - webhookEventId + userId prevents LINE webhook redelivery from double-counting
+    """
+    source = event.get("source") or {}
+    if source.get("type") != "group":
+        return
+
+    group_id = source.get("groupId")
+    if not group_id:
+        return
+
+    members = (event.get("left") or {}).get("members") or []
+    if not members:
+        return
+
+    occurred_at_ms = event.get("timestamp")
+    if not isinstance(occurred_at_ms, int):
+        occurred_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    webhook_event_id = event.get("webhookEventId") or (
+        f"{group_id}:{occurred_at_ms}"
+    )
+
+    # Save each leaving member. INSERT OR IGNORE prevents redelivery duplicates.
+    with db() as conn:
+        for i, member in enumerate(members):
+            member_user_id = (member or {}).get("userId")
+            # userId should normally exist. Fallback still keeps multiple members
+            # in the same webhook as separate leave records.
+            dedupe_user_id = member_user_id or f"unknown-{i}"
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO group_leave_events(
+                    group_id,
+                    user_id,
+                    webhook_event_id,
+                    occurred_at_ms,
+                    created_at
+                )
+                VALUES(?,?,?,?,?)
+                """,
+                (
+                    group_id,
+                    dedupe_user_id,
+                    webhook_event_id,
+                    occurred_at_ms,
+                    now_iso(),
+                ),
+            )
+
+        # Keep the table small; anything older than 10 minutes is irrelevant.
+        conn.execute(
+            """
+            DELETE FROM group_leave_events
+            WHERE occurred_at_ms < ?
+            """,
+            (
+                occurred_at_ms - (10 * 60 * 1000),
+            ),
+        )
+
+        window_start_ms = (
+            occurred_at_ms
+            - LEAVE_ALERT_WINDOW_SECONDS * 1000
+        )
+
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM group_leave_events
+            WHERE group_id=?
+              AND occurred_at_ms>=?
+              AND occurred_at_ms<=?
+            """,
+            (
+                group_id,
+                window_start_ms,
+                occurred_at_ms,
+            ),
+        ).fetchone()
+
+        leave_count = int(row["cnt"] if row else 0)
+
+        state = conn.execute(
+            """
+            SELECT last_alert_at_ms, last_alert_count
+            FROM leave_alert_state
+            WHERE group_id=?
+            """,
+            (group_id,),
+        ).fetchone()
+
+        last_alert_at_ms = (
+            int(state["last_alert_at_ms"])
+            if state
+            else 0
+        )
+
+        cooldown_ms = LEAVE_ALERT_COOLDOWN_SECONDS * 1000
+        should_alert = (
+            leave_count >= LEAVE_ALERT_THRESHOLD
+            and (
+                not last_alert_at_ms
+                or occurred_at_ms - last_alert_at_ms >= cooldown_ms
+            )
+        )
+
+        if should_alert:
+            conn.execute(
+                """
+                INSERT INTO leave_alert_state(
+                    group_id,
+                    last_alert_at_ms,
+                    last_alert_count
+                )
+                VALUES(?,?,?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                    last_alert_at_ms=excluded.last_alert_at_ms,
+                    last_alert_count=excluded.last_alert_count
+                """,
+                (
+                    group_id,
+                    occurred_at_ms,
+                    leave_count,
+                ),
+            )
+
+    if not should_alert:
+        return
+
+    owner_id = get_owner_user_id()
+    if not owner_id:
+        return
+
+    summary = get_group_summary(group_id) or {}
+    group_name = summary.get("groupName") or "LINE 群組"
+    alert_time = _format_taipei_time(occurred_at_ms)
+
+    alert_text = (
+        "🚨【防翻群異常警報】\n"
+        f"群組：{group_name}\n"
+        f"⚠️ 30 秒內已有 {leave_count} 位成員離開／被移除\n"
+        f"時間：{alert_time}\n\n"
+        "請立即查看群組狀況。"
+    )
+
+    # Private push to Owner only. Nothing is sent to the group.
+    push_messages(
+        owner_id,
+        [
+            {
+                "type": "text",
+                "text": alert_text,
+            }
+        ],
+    )
 
 
 def fetch_line_image(message_id):
@@ -1388,7 +1613,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "12-dynamic-spec-unsend-safe",
+        "version": "13-mass-leave-private-alert",
     })
 
 
@@ -1436,6 +1661,13 @@ def webhook():
 
     for event in body.get("events", []):
         event_type = event.get("type")
+
+        # ---------- ANTI-RAID: MASS MEMBER LEAVE ----------
+        # LINE memberLeft webhook can contain one or multiple members.
+        # If 2+ members leave within 30 seconds, alert Owner privately only.
+        if event_type == "memberLeft":
+            record_member_left_and_maybe_alert(event)
+            continue
 
         # 客人收回 LINE 訊息時，LINE 會送 unsend 事件。
         # 這裡刻意忽略：已成立的喊單不會因收回訊息而刪除。
