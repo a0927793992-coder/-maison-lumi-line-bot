@@ -95,7 +95,6 @@ def init_db():
         );
         """)
 
-        # Upgrade older databases
         for column, ddl in [
             ("owner_user_id", "ALTER TABLE products ADD COLUMN owner_user_id TEXT"),
             ("is_closed", "ALTER TABLE products ADD COLUMN is_closed INTEGER NOT NULL DEFAULT 0"),
@@ -140,15 +139,16 @@ def is_admin(user_id):
     return bool(admin_id and user_id and admin_id == user_id)
 
 
-
 def is_staff(user_id):
     if not user_id:
         return False
+
     with db() as conn:
         row = conn.execute(
             "SELECT 1 FROM staff WHERE user_id=?",
             (user_id,),
         ).fetchone()
+
     return bool(row)
 
 
@@ -157,9 +157,9 @@ def can_manage_orders(user_id):
 
 
 def generate_staff_invite():
-    # Six-digit one-time code.
     for _ in range(20):
         code = f"{secrets.randbelow(1000000):06d}"
+
         try:
             with db() as conn:
                 conn.execute(
@@ -170,8 +170,10 @@ def generate_staff_invite():
                     (code, now_iso()),
                 )
             return code
+
         except sqlite3.IntegrityError:
             continue
+
     raise RuntimeError("Could not generate invite code")
 
 
@@ -210,6 +212,12 @@ def redeem_staff_invite(code, user_id):
     return True
 
 
+def short_code(user_id):
+    return hashlib.sha256(
+        (user_id or "?").encode()
+    ).hexdigest()[:4].upper()
+
+
 def staff_list_text():
     with db() as conn:
         rows = conn.execute(
@@ -224,9 +232,14 @@ def staff_list_text():
         return "目前沒有小幫手。"
 
     lines = ["👥 小幫手列表"]
+
     for i, row in enumerate(rows, start=1):
-        name = row["display_name"] or f"小幫手 #{short_code(row['user_id'])}"
+        name = (
+            row["display_name"]
+            or f"小幫手 #{short_code(row['user_id'])}"
+        )
         lines.append(f"{i}. {name}")
+
     return "\n".join(lines)
 
 
@@ -241,15 +254,21 @@ def verify_signature(raw_body, signature):
     ).digest()
 
     expected = base64.b64encode(digest).decode()
-    return hmac.compare_digest(expected, signature)
+
+    return hmac.compare_digest(
+        expected,
+        signature,
+    )
 
 
 def auth_headers(json_mode=False):
     headers = {
         "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
     }
+
     if json_mode:
         headers["Content-Type"] = "application/json"
+
     return headers
 
 
@@ -267,6 +286,7 @@ def reply_messages(reply_token, messages):
             },
             timeout=10,
         )
+
     except requests.RequestException:
         pass
 
@@ -285,6 +305,7 @@ def push_messages(user_id, messages):
             },
             timeout=10,
         )
+
     except requests.RequestException:
         pass
 
@@ -292,43 +313,50 @@ def push_messages(user_id, messages):
 def reply_text(reply_token, text):
     reply_messages(
         reply_token,
-        [{"type": "text", "text": text[:5000]}],
+        [
+            {
+                "type": "text",
+                "text": text[:5000],
+            }
+        ],
     )
-
-
-def push_text(user_id, text):
-    push_messages(
-        user_id,
-        [{"type": "text", "text": text[:5000]}],
-    )
-
 
 
 def get_user_profile(user_id):
     if not CHANNEL_ACCESS_TOKEN or not user_id:
         return None
+
     try:
         r = requests.get(
             f"https://api.line.me/v2/bot/profile/{user_id}",
             headers=auth_headers(),
             timeout=10,
         )
+
         if r.ok:
             return r.json()
+
     except requests.RequestException:
         pass
+
     return None
 
 
 def refresh_staff_name(user_id):
     if not is_staff(user_id):
         return
+
     profile = get_user_profile(user_id)
     name = (profile or {}).get("displayName")
+
     if name:
         with db() as conn:
             conn.execute(
-                "UPDATE staff SET display_name=? WHERE user_id=?",
+                """
+                UPDATE staff
+                SET display_name=?
+                WHERE user_id=?
+                """,
                 (name, user_id),
             )
 
@@ -346,12 +374,15 @@ def get_group_profile(group_id, user_id):
             headers=auth_headers(),
             timeout=10,
         )
+
         if r.ok:
             data = r.json()
+
             return {
                 "displayName": data.get("displayName") or user_id,
                 "pictureUrl": data.get("pictureUrl"),
             }
+
     except requests.RequestException:
         pass
 
@@ -359,12 +390,6 @@ def get_group_profile(group_id, user_id):
         "displayName": user_id or "未知會員",
         "pictureUrl": None,
     }
-
-
-def short_code(user_id):
-    return hashlib.sha256(
-        (user_id or "?").encode()
-    ).hexdigest()[:4].upper()
 
 
 def remember_image(message_id, group_id, sender_user_id):
@@ -396,47 +421,43 @@ def get_pending_image(group_id, message_id):
             FROM pending_images
             WHERE message_id=? AND group_id=?
             """,
-            (message_id, group_id),
+            (
+                message_id,
+                group_id,
+            ),
         ).fetchone()
 
 
 def fetch_line_image_preview(message_id):
-    """Download a smaller preview image from LINE and return (bytes, mime)."""
     if not CHANNEL_ACCESS_TOKEN or not message_id:
         return None, None
 
-    try:
-        r = requests.get(
-            f"https://api-data.line.me/v2/bot/message/{message_id}/content/preview",
-            headers=auth_headers(),
-            timeout=20,
-        )
+    for suffix in ["/preview", ""]:
+        try:
+            r = requests.get(
+                f"https://api-data.line.me/v2/bot/message/{message_id}/content{suffix}",
+                headers=auth_headers(),
+                timeout=20,
+            )
 
-        if r.ok and r.content:
-            mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
-            return r.content, mime
-    except requests.RequestException:
-        pass
+            if r.ok and r.content:
+                mime = (
+                    r.headers.get("Content-Type")
+                    or "image/jpeg"
+                ).split(";")[0]
 
-    # Some images may not support preview. Try original content as fallback.
-    try:
-        r = requests.get(
-            f"https://api-data.line.me/v2/bot/message/{message_id}/content",
-            headers=auth_headers(),
-            timeout=20,
-        )
+                return r.content, mime
 
-        if r.ok and r.content:
-            mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
-            return r.content, mime
-    except requests.RequestException:
-        pass
+        except requests.RequestException:
+            pass
 
     return None, None
 
 
 def save_product_image(product_id, message_id):
-    blob, mime = fetch_line_image_preview(message_id)
+    blob, mime = fetch_line_image_preview(
+        message_id
+    )
 
     if not blob:
         return False
@@ -448,15 +469,24 @@ def save_product_image(product_id, message_id):
             SET image_blob=?, image_mime=?
             WHERE id=?
             """,
-            (sqlite3.Binary(blob), mime, product_id),
+            (
+                sqlite3.Binary(blob),
+                mime,
+                product_id,
+            ),
         )
+
     return True
 
 
 def create_product(group_id, image_message_id, owner_user_id):
     with db() as conn:
         existing = conn.execute(
-            "SELECT * FROM products WHERE image_message_id=?",
+            """
+            SELECT *
+            FROM products
+            WHERE image_message_id=?
+            """,
             (image_message_id,),
         ).fetchone()
 
@@ -497,18 +527,21 @@ def create_product(group_id, image_message_id, owner_user_id):
             SET product_code=?
             WHERE id=?
             """,
-            (product_code, product_id),
+            (
+                product_code,
+                product_id,
+            ),
         )
 
-        product = conn.execute(
-            "SELECT * FROM products WHERE id=?",
-            (product_id,),
-        ).fetchone()
+    save_product_image(
+        product_id,
+        image_message_id,
+    )
 
-    # Download image outside the DB transaction.
-    save_product_image(product_id, image_message_id)
-
-    return get_product_by_code(product_code), True
+    return (
+        get_product_by_code(product_code),
+        True,
+    )
 
 
 def get_product_by_code(product_code):
@@ -539,43 +572,27 @@ def ensure_product_image(product):
     if not product:
         return None
 
-    if product["image_blob"]:
-        return product
+    if not product["image_blob"]:
+        save_product_image(
+            product["id"],
+            product["image_message_id"],
+        )
 
-    # Try to recover the photo for products created before this version.
-    save_product_image(
-        product["id"],
-        product["image_message_id"],
-    )
+        product = get_product_by_code(
+            product["product_code"]
+        )
 
-    return get_product_by_code(
-        product["product_code"]
-    )
+    return product
 
 
 def product_image_url(product):
-    if not product:
-        return None
-
     product = ensure_product_image(product)
 
     if not product or not product["image_blob"]:
         return None
 
-    if not product["image_key"]:
-        key = secrets.token_urlsafe(16)
-        with db() as conn:
-            conn.execute(
-                """
-                UPDATE products
-                SET image_key=?
-                WHERE id=?
-                """,
-                (key, product["id"]),
-            )
-        product = get_product_by_code(product["product_code"])
-
     base = request.host_url.rstrip("/")
+
     return (
         f"{base}/product-image/"
         f"{product['product_code']}/"
@@ -591,7 +608,10 @@ def add_order(product_id, user_id, display_name, qty):
             FROM orders
             WHERE product_id=? AND user_id=?
             """,
-            (product_id, user_id),
+            (
+                product_id,
+                user_id,
+            ),
         ).fetchone()
 
         new_qty = (
@@ -634,7 +654,10 @@ def cancel_order(product_id, user_id):
             DELETE FROM orders
             WHERE product_id=? AND user_id=?
             """,
-            (product_id, user_id),
+            (
+                product_id,
+                user_id,
+            ),
         )
 
 
@@ -666,68 +689,18 @@ def set_product_closed(product_id, closed):
         )
 
 
-def build_member_row(product, order, duplicate_names):
-    name = order["display_name"] or "未知會員"
-
-    if name in duplicate_names:
-        name = f"{name} #{short_code(order['user_id'])}"
-
-    profile = get_group_profile(
-        product["group_id"],
-        order["user_id"],
-    )
-    picture_url = profile.get("pictureUrl")
-
-    contents = []
-
-    if picture_url:
-        contents.append({
-            "type": "image",
-            "url": picture_url,
-            "size": "xxs",
-            "aspectMode": "cover",
-            "aspectRatio": "1:1",
-            "flex": 0,
-        })
-
-    contents.extend([
-        {
-            "type": "text",
-            "text": name,
-            "size": "sm",
-            "color": "#333333",
-            "flex": 1,
-            "margin": "md" if picture_url else "none",
-            "wrap": True,
-        },
-        {
-            "type": "text",
-            "text": f"× {order['quantity']}",
-            "size": "sm",
-            "weight": "bold",
-            "align": "end",
-            "color": "#111111",
-            "flex": 0,
-        },
-    ])
-
-    return {
-        "type": "box",
-        "layout": "horizontal",
-        "alignItems": "center",
-        "margin": "md",
-        "contents": contents,
-    }
-
-
 def build_product_flex(product, title=None):
     product = ensure_product_image(product)
     orders = get_orders(product["id"])
 
     counts = Counter(
-        (row["display_name"] or "未知會員")
+        (
+            row["display_name"]
+            or "未知會員"
+        )
         for row in orders
     )
+
     duplicate_names = {
         name
         for name, count in counts.items()
@@ -739,23 +712,24 @@ def build_product_flex(product, title=None):
         for row in orders
     )
 
-    status_text = (
-        "🔒 已結單"
-        if product["is_closed"]
-        else "🟢 開放喊單"
-    )
-
     body_contents = [
         {
             "type": "text",
-            "text": title or f"商品 {product['product_code']}",
+            "text": (
+                title
+                or f"商品 {product['product_code']}"
+            ),
             "weight": "bold",
             "size": "xl",
             "wrap": True,
         },
         {
             "type": "text",
-            "text": status_text,
+            "text": (
+                "🔒 已結單"
+                if product["is_closed"]
+                else "🟢 開放喊單"
+            ),
             "size": "sm",
             "color": "#666666",
             "margin": "sm",
@@ -768,13 +742,61 @@ def build_product_flex(product, title=None):
 
     if orders:
         for order in orders:
-            body_contents.append(
-                build_member_row(
-                    product,
-                    order,
-                    duplicate_names,
-                )
+            name = (
+                order["display_name"]
+                or "未知會員"
             )
+
+            if name in duplicate_names:
+                name = (
+                    f"{name} "
+                    f"#{short_code(order['user_id'])}"
+                )
+
+            profile = get_group_profile(
+                product["group_id"],
+                order["user_id"],
+            )
+
+            row_contents = []
+
+            if profile.get("pictureUrl"):
+                row_contents.append({
+                    "type": "image",
+                    "url": profile["pictureUrl"],
+                    "size": "xxs",
+                    "aspectMode": "cover",
+                    "aspectRatio": "1:1",
+                    "flex": 0,
+                })
+
+            row_contents.extend([
+                {
+                    "type": "text",
+                    "text": name,
+                    "size": "sm",
+                    "flex": 1,
+                    "margin": "md",
+                    "wrap": True,
+                },
+                {
+                    "type": "text",
+                    "text": f"× {order['quantity']}",
+                    "size": "sm",
+                    "weight": "bold",
+                    "align": "end",
+                    "flex": 0,
+                },
+            ])
+
+            body_contents.append({
+                "type": "box",
+                "layout": "horizontal",
+                "alignItems": "center",
+                "margin": "md",
+                "contents": row_contents,
+            })
+
     else:
         body_contents.append({
             "type": "text",
@@ -790,25 +812,14 @@ def build_product_flex(product, title=None):
             "margin": "lg",
         },
         {
-            "type": "box",
-            "layout": "horizontal",
+            "type": "text",
+            "text": (
+                f"👥 {len(orders)} 人　"
+                f"📦 總數 {total_qty}"
+            ),
+            "size": "sm",
+            "weight": "bold",
             "margin": "lg",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": f"👥 {len(orders)} 人",
-                    "size": "sm",
-                    "flex": 1,
-                },
-                {
-                    "type": "text",
-                    "text": f"📦 總數 {total_qty}",
-                    "size": "sm",
-                    "weight": "bold",
-                    "align": "end",
-                    "flex": 1,
-                },
-            ],
         },
     ])
 
@@ -823,6 +834,7 @@ def build_product_flex(product, title=None):
     }
 
     image_url = product_image_url(product)
+
     if image_url:
         bubble["hero"] = {
             "type": "image",
@@ -840,7 +852,7 @@ def build_product_flex(product, title=None):
 
 
 def build_created_product_flex(product):
-    product = ensure_product_image(product)
+    image_url = product_image_url(product)
 
     bubble = {
         "type": "bubble",
@@ -860,15 +872,16 @@ def build_created_product_flex(product):
                     "type": "text",
                     "text": "新商品已建立",
                     "size": "sm",
-                    "color": "#666666",
                     "align": "center",
                     "margin": "sm",
                 },
                 {
                     "type": "text",
-                    "text": f"私訊「{product['product_code']} 查單」即可查看",
+                    "text": (
+                        f"私訊「{product['product_code']} 查單」"
+                        "即可查看"
+                    ),
                     "size": "xs",
-                    "color": "#777777",
                     "wrap": True,
                     "align": "center",
                     "margin": "md",
@@ -877,7 +890,6 @@ def build_created_product_flex(product):
         },
     }
 
-    image_url = product_image_url(product)
     if image_url:
         bubble["hero"] = {
             "type": "image",
@@ -889,7 +901,9 @@ def build_created_product_flex(product):
 
     return {
         "type": "flex",
-        "altText": f"新商品 {product['product_code']}",
+        "altText": (
+            f"新商品 {product['product_code']}"
+        ),
         "contents": bubble,
     }
 
@@ -923,9 +937,12 @@ def format_product_list():
             if row["is_closed"]
             else "🟢"
         )
+
         lines.append(
-            f"{status} {row['product_code']}｜"
-            f"{row['people']}人｜{row['qty']}件"
+            f"{status} "
+            f"{row['product_code']}｜"
+            f"{row['people']}人｜"
+            f"{row['qty']}件"
         )
 
     lines.extend([
@@ -941,17 +958,21 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "4-photo-flex",
+        "version": "6-owner-staff-photo",
     })
 
 
 @app.get("/product-image/<product_code>/<image_key>")
-def serve_product_image(product_code, image_key):
-    product = get_product_by_code(product_code)
+def serve_product_image(
+    product_code,
+    image_key,
+):
+    product = get_product_by_code(
+        product_code
+    )
 
     if (
         not product
-        or not product["image_key"]
         or product["image_key"] != image_key
         or not product["image_blob"]
     ):
@@ -959,10 +980,10 @@ def serve_product_image(product_code, image_key):
 
     return Response(
         bytes(product["image_blob"]),
-        mimetype=product["image_mime"] or "image/jpeg",
-        headers={
-            "Cache-Control": "private, max-age=86400",
-        },
+        mimetype=(
+            product["image_mime"]
+            or "image/jpeg"
+        ),
     )
 
 
@@ -979,9 +1000,17 @@ def webhook():
     ):
         abort(400)
 
-    body = request.get_json(silent=True) or {}
+    body = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
-    for event in body.get("events", []):
+    for event in body.get(
+        "events",
+        [],
+    ):
         if event.get("type") != "message":
             continue
 
@@ -993,51 +1022,48 @@ def webhook():
         message_type = message.get("type")
         reply_token = event.get("replyToken")
 
-        # =========================================
-        # PRIVATE CHAT: ADMIN CONSOLE
-        # =========================================
+        # PRIVATE CHAT
         if source_type == "user":
-            if message_type != "text" or not user_id:
+            if (
+                message_type != "text"
+                or not user_id
+            ):
                 continue
 
-            text = message.get("text", "").strip()
+            text = message.get(
+                "text",
+                "",
+            ).strip()
 
-            if text == "設定管理員":
-                current_admin = get_admin_user_id()
-
-                if ADMIN_USER_ID_ENV:
-                    if user_id == ADMIN_USER_ID_ENV:
-                        reply_text(
-                            reply_token,
-                            "✅ 你已經是 Maison Lumi 管理員。",
-                        )
-                    else:
-                        reply_text(
-                            reply_token,
-                            "⚠️ 此帳號不是系統設定的管理員。",
-                        )
-                    continue
+            if text in (
+                "設定Owner",
+                "設定管理員",
+            ):
+                current = get_admin_user_id()
 
                 if (
-                    current_admin
-                    and current_admin != user_id
+                    current
+                    and current != user_id
                 ):
                     reply_text(
                         reply_token,
-                        "⚠️ 系統已經有其他管理員，無法在 LINE 內變更。",
+                        "⚠️ Owner 已經設定完成，"
+                        "無法由其他帳號變更。",
                     )
-                    continue
 
-                set_setting(
-                    "admin_user_id",
-                    user_id,
-                )
+                else:
+                    set_setting(
+                        "admin_user_id",
+                        user_id,
+                    )
 
-                reply_text(
-                    reply_token,
-                    "✅ 管理員設定完成。\n"
-                    "商品編號、查單、結單、開單都會在這個私人聊天室處理。",
-                )
+                    reply_text(
+                        reply_token,
+                        "👑 Owner 設定完成。\n"
+                        "之後只有你可以產生"
+                        "小幫手邀請碼。",
+                    )
+
                 continue
 
             join_match = re.match(
@@ -1046,42 +1072,74 @@ def webhook():
             )
 
             if join_match:
-                if redeem_staff_invite(join_match.group(1), user_id):
-                    refresh_staff_name(user_id)
+                if redeem_staff_invite(
+                    join_match.group(1),
+                    user_id,
+                ):
+                    refresh_staff_name(
+                        user_id
+                    )
+
                     reply_text(
                         reply_token,
                         "✅ 已加入成為小幫手。\n"
-                        "現在可以使用：A001 查單 / A001 結單 / A001 開單 / 商品列表",
+                        "現在可以查單、結單、開單、"
+                        "查看商品列表，也可以在群組"
+                        "貼商品照片建立編號。",
                     )
+
                 else:
                     reply_text(
                         reply_token,
-                        "⚠️ 邀請碼無效或已經使用過。",
+                        "⚠️ 邀請碼無效或已使用。",
                     )
+
                 continue
 
             if text == "產生小幫手邀請碼":
                 if not is_admin(user_id):
-                    reply_text(reply_token, "⚠️ 只有 Owner 可以產生小幫手邀請碼。")
-                    continue
+                    reply_text(
+                        reply_token,
+                        "⚠️ 只有 Owner 可以產生"
+                        "小幫手邀請碼。",
+                    )
 
-                invite_code = generate_staff_invite()
-                reply_text(
-                    reply_token,
-                    f"👥 小幫手一次性邀請碼：{invite_code}\n\n"
-                    f"請小幫手加官方帳號好友後，私訊：\n加入小幫手 {invite_code}\n\n"
-                    "此邀請碼只能使用一次。",
-                )
+                else:
+                    invite_code = (
+                        generate_staff_invite()
+                    )
+
+                    reply_text(
+                        reply_token,
+                        "👥 小幫手一次性邀請碼："
+                        f"{invite_code}\n\n"
+                        "請小幫手加官方帳號好友後，"
+                        "私訊：\n"
+                        f"加入小幫手 {invite_code}\n\n"
+                        "此邀請碼只能使用一次。",
+                    )
+
                 continue
 
             if text == "小幫手列表":
                 if not is_admin(user_id):
-                    reply_text(reply_token, "⚠️ 只有 Owner 可以查看小幫手列表。")
-                    continue
-                reply_text(reply_token, staff_list_text())
+                    reply_text(
+                        reply_token,
+                        "⚠️ 只有 Owner 可以查看"
+                        "小幫手列表。",
+                    )
+
+                else:
+                    reply_text(
+                        reply_token,
+                        staff_list_text(),
+                    )
+
                 continue
 
-            if not can_manage_orders(user_id):
+            if not can_manage_orders(
+                user_id
+            ):
                 continue
 
             if PRODUCT_LIST_RE.match(text):
@@ -1094,22 +1152,29 @@ def webhook():
             cmd = ADMIN_CMD_RE.match(text)
 
             if not cmd:
-                reply_text(
-                    reply_token,
+                help_text = (
                     "管理指令：\n"
                     "A001 查單\n"
                     "A001 結單\n"
                     "A001 開單\n"
-                    "商品列表\n"
-                    + (
-                        "產生小幫手邀請碼\n小幫手列表"
-                        if is_admin(user_id)
-                        else ""
-                    ),
+                    "商品列表"
+                )
+
+                if is_admin(user_id):
+                    help_text += (
+                        "\n產生小幫手邀請碼"
+                        "\n小幫手列表"
+                    )
+
+                reply_text(
+                    reply_token,
+                    help_text,
                 )
                 continue
 
-            product_code = cmd.group(1).upper()
+            product_code = (
+                cmd.group(1).upper()
+            )
             action = cmd.group(2)
 
             product = get_product_by_code(
@@ -1123,7 +1188,10 @@ def webhook():
                 )
                 continue
 
-            if action in ("查單", "名單"):
+            if action in (
+                "查單",
+                "名單",
+            ):
                 reply_messages(
                     reply_token,
                     [
@@ -1133,51 +1201,46 @@ def webhook():
                         )
                     ],
                 )
-                continue
 
-            if action == "結單":
+            elif action == "結單":
                 set_product_closed(
                     product["id"],
                     True,
                 )
-                product = get_product_by_code(
-                    product_code
-                )
+
                 reply_messages(
                     reply_token,
                     [
                         build_product_flex(
-                            product,
+                            get_product_by_code(
+                                product_code
+                            ),
                             f"🔒 {product_code} 已結單",
                         )
                     ],
                 )
-                continue
 
-            if action == "開單":
+            elif action == "開單":
                 set_product_closed(
                     product["id"],
                     False,
                 )
-                product = get_product_by_code(
-                    product_code
-                )
+
                 reply_messages(
                     reply_token,
                     [
                         build_product_flex(
-                            product,
+                            get_product_by_code(
+                                product_code
+                            ),
                             f"🟢 {product_code} 已重新開單",
                         )
                     ],
                 )
-                continue
 
             continue
 
-        # =========================================
-        # GROUP: PRODUCT PHOTOS + SILENT ORDERS
-        # =========================================
+        # GROUP CHAT
         if source_type != "group":
             continue
 
@@ -1186,8 +1249,8 @@ def webhook():
         if not group_id or not user_id:
             continue
 
-        # Admin posts a product photo:
-        # create code and privately send code + the same photo.
+        # Owner or staff posts product photo:
+        # create code and privately send photo + code.
         if message_type == "image":
             message_id = message.get("id")
 
@@ -1200,11 +1263,13 @@ def webhook():
                 user_id,
             )
 
-            if is_admin(user_id):
-                product, created = create_product(
-                    group_id,
-                    message_id,
-                    user_id,
+            if can_manage_orders(user_id):
+                product, created = (
+                    create_product(
+                        group_id,
+                        message_id,
+                        user_id,
+                    )
                 )
 
                 if created:
@@ -1227,11 +1292,12 @@ def webhook():
             "",
         ).strip()
 
-        quoted_message_id = message.get(
-            "quotedMessageId"
+        quoted_message_id = (
+            message.get(
+                "quotedMessageId"
+            )
         )
 
-        # No management responses in group.
         if not quoted_message_id:
             continue
 
@@ -1250,22 +1316,22 @@ def webhook():
                 group_id,
                 quoted_message_id,
             )
-            admin_id = get_admin_user_id()
 
             if (
                 image
-                and admin_id
-                and image["sender_user_id"] == admin_id
+                and can_manage_orders(
+                    image["sender_user_id"]
+                )
             ):
                 product, _ = create_product(
                     group_id,
                     quoted_message_id,
-                    admin_id,
+                    image["sender_user_id"],
                 )
+
             else:
                 continue
 
-        # Closed products ignore new + commands.
         if product["is_closed"]:
             continue
 
@@ -1273,13 +1339,16 @@ def webhook():
             group_id,
             user_id,
         )
+
         display_name = (
             profile.get("displayName")
             or user_id
         )
 
         if plus:
-            qty = int(plus.group(1))
+            qty = int(
+                plus.group(1)
+            )
 
             if 1 <= qty <= 99:
                 add_order(
