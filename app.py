@@ -25,6 +25,7 @@ CANCEL_ONLY_RE = re.compile(r"^\s*(取消|刪單|cancel)\s*$", re.IGNORECASE)
 SPEC_CANCEL_RE = re.compile(r"^\s*(.+?)\s*(取消|刪單)\s*$", re.IGNORECASE)
 ADMIN_QUERY_RE = re.compile(r"^\s*(.+?[A-Z]\d{3,})\s*(查單|結單)\s*$", re.IGNORECASE)
 START_SESSION_RE = re.compile(r"^\s*開始連線\s+(.+?)\s*$")
+AUTO_SESSION_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}(?:\s*[-~～至]\s*(?:\d{1,2}/)?\d{1,2})?\s*.+?\s*$")
 END_SESSION_RE = re.compile(r"^\s*結束連線(?:\s+(.+?))?\s*$")
 JOIN_STAFF_RE = re.compile(r"^\s*加入小幫手\s+(\d{6})\s*$")
 PRODUCT_LIST_RE = re.compile(r"^\s*(商品列表|商品清單)\s*$")
@@ -1283,7 +1284,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "7-live-session-specs",
+        "version": "8-auto-session-date",
     })
 
 
@@ -1483,12 +1484,20 @@ def webhook():
                 continue
 
             start_match = START_SESSION_RE.match(text)
-            if start_match:
+            auto_start_match = AUTO_SESSION_RE.match(text)
+
+            if start_match or auto_start_match:
                 if not is_owner(user_id):
                     continue
 
-                session = start_session(
+                session_name = (
                     start_match.group(1)
+                    if start_match
+                    else text
+                )
+
+                session = start_session(
+                    session_name
                 )
 
                 reply_text(
@@ -1592,7 +1601,8 @@ def webhook():
                 reply_text(
                     reply_token,
                     "Owner 指令：\n"
-                    "開始連線 8/18-19 香港\n"
+                    "8/18-19 香港\n"
+                    "或：開始連線 8/18-19 香港\n"
                     "結束連線\n"
                     "商品列表\n"
                     "產生小幫手邀請碼\n"
