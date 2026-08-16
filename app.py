@@ -116,6 +116,7 @@ def init_db():
             sender_user_id TEXT,
             image_blob BLOB,
             image_mime TEXT,
+            price INTEGER,
             created_at TEXT NOT NULL
         );
 
@@ -131,6 +132,7 @@ def init_db():
             image_key TEXT,
             image_blob BLOB,
             image_mime TEXT,
+            price INTEGER,
             created_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES sessions(id)
         );
@@ -174,6 +176,16 @@ def init_db():
             PRIMARY KEY(product_id, spec_name),
             FOREIGN KEY(product_id) REFERENCES products(id)
         );
+
+        CREATE TABLE IF NOT EXISTS message_threads (
+            message_id TEXT PRIMARY KEY,
+            group_id TEXT NOT NULL,
+            root_image_message_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_message_threads_group_root
+        ON message_threads(group_id, root_image_message_id);
         """)
 
         # Upgrade older products table if needed.
@@ -185,6 +197,7 @@ def init_db():
             ("image_key", "ALTER TABLE products ADD COLUMN image_key TEXT"),
             ("image_blob", "ALTER TABLE products ADD COLUMN image_blob BLOB"),
             ("image_mime", "ALTER TABLE products ADD COLUMN image_mime TEXT"),
+            ("price", "ALTER TABLE products ADD COLUMN price INTEGER"),
         ]:
             if not column_exists(conn, "products", column):
                 conn.execute(ddl)
@@ -192,6 +205,7 @@ def init_db():
         for column, ddl in [
             ("image_blob", "ALTER TABLE pending_images ADD COLUMN image_blob BLOB"),
             ("image_mime", "ALTER TABLE pending_images ADD COLUMN image_mime TEXT"),
+            ("price", "ALTER TABLE pending_images ADD COLUMN price INTEGER"),
         ]:
             if not column_exists(conn, "pending_images", column):
                 conn.execute(ddl)
@@ -911,6 +925,68 @@ def allocate_product_code(session, group_id):
     )
 
 
+# ---------- Reply-thread / price helpers ----------
+
+PRICE_RE = re.compile(r"^\s*(?:NT\$|TWD\s*|\$|＄)?\s*(\d{1,7})\s*(?:元|塊)?\s*$", re.IGNORECASE)
+
+def parse_price_text(text):
+    match = PRICE_RE.fullmatch((text or "").strip())
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if 0 < value <= 9999999 else None
+
+def remember_thread_message(message_id, group_id, root_image_message_id):
+    if not message_id or not group_id or not root_image_message_id:
+        return
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO message_threads(message_id, group_id, root_image_message_id, created_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                group_id=excluded.group_id,
+                root_image_message_id=excluded.root_image_message_id
+            """,
+            (message_id, group_id, root_image_message_id, now_iso()),
+        )
+
+def resolve_root_image(group_id, quoted_message_id):
+    if not group_id or not quoted_message_id:
+        return None
+
+    # Direct reply to an original product photo.
+    if get_pending_image(group_id, quoted_message_id):
+        return quoted_message_id
+
+    product = get_product_by_image(quoted_message_id)
+    if product and product["group_id"] == group_id:
+        return quoted_message_id
+
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT root_image_message_id
+            FROM message_threads
+            WHERE message_id=? AND group_id=?
+            """,
+            (quoted_message_id, group_id),
+        ).fetchone()
+    return row["root_image_message_id"] if row else None
+
+def set_product_price_by_root(group_id, root_image_message_id, price):
+    if not group_id or not root_image_message_id or price is None:
+        return
+    with db() as conn:
+        conn.execute(
+            "UPDATE pending_images SET price=? WHERE message_id=? AND group_id=?",
+            (price, root_image_message_id, group_id),
+        )
+        conn.execute(
+            "UPDATE products SET price=? WHERE image_message_id=? AND group_id=?",
+            (price, root_image_message_id, group_id),
+        )
+
 # ---------- Images / products ----------
 
 def remember_image(message_id, group_id, sender_user_id):
@@ -1004,9 +1080,10 @@ def create_product_from_pending(image):
                 image_key,
                 image_blob,
                 image_mime,
+                price,
                 created_at
             )
-            VALUES(?,?,?,?,?,?,0,?,?,?,?)
+            VALUES(?,?,?,?,?,?,0,?,?,?,?,?)
             """,
             (
                 product_code,
@@ -1018,6 +1095,7 @@ def create_product_from_pending(image):
                 secrets.token_urlsafe(16),
                 image["image_blob"],
                 image["image_mime"],
+                image["price"] if "price" in image.keys() else None,
                 now_iso(),
             ),
         )
@@ -1483,6 +1561,16 @@ def build_product_card(product, viewer_user_id, title=None):
             "color": "#666666",
             "margin": "sm",
         },
+        *([
+            {
+                "type": "text",
+                "text": f"💰 價格 NT$ {product['price']}",
+                "size": "sm",
+                "weight": "bold",
+                "margin": "sm",
+                "wrap": True,
+            }
+        ] if product["price"] is not None else []),
         {
             "type": "separator",
             "margin": "lg",
@@ -1862,7 +1950,8 @@ def procurement_list_text(mode="waiting"):
             shown_rows += 1
 
         if product_lines:
-            lines.append(f"【{product['product_code']}】")
+            price_label = f"｜NT$ {product['price']}" if product["price"] is not None else ""
+            lines.append(f"【{product['product_code']}{price_label}】")
             lines.extend(product_lines)
             lines.append("")
 
@@ -1913,6 +2002,16 @@ def build_end_session_product_bubble(product):
             "size": "lg",
             "wrap": True,
         },
+        *([
+            {
+                "type": "text",
+                "text": f"💰 NT$ {product['price']}",
+                "size": "sm",
+                "weight": "bold",
+                "margin": "xs",
+                "wrap": True,
+            }
+        ] if product["price"] is not None else []),
         {
             "type": "text",
             "text": (
@@ -2065,7 +2164,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "14-procurement-tracking",
+        "version": "15-thread-price-tracking",
     })
 
 
@@ -2556,20 +2655,50 @@ def webhook():
         if not quoted_message_id:
             continue
 
-        parsed = parse_order_text(
-            message.get("text", "")
-        )
-
-        if not parsed:
-            continue
-
-        pending = get_pending_image(
+        # Follow the whole LINE reply chain back to the original product photo.
+        # Example: photo -> 問價格 -> 199 -> +1.
+        root_image_message_id = resolve_root_image(
             group_id,
             quoted_message_id,
         )
 
+        if not root_image_message_id:
+            continue
+
+        current_message_id = message.get("id")
+        if current_message_id:
+            remember_thread_message(
+                current_message_id,
+                group_id,
+                root_image_message_id,
+            )
+
+        text_value = message.get("text", "")
+
+        # Owner / staff can simply reply 199, $199, 199元, etc.
+        # The price is saved to the product thread and the group stays silent.
+        price_value = parse_price_text(text_value)
+        if price_value is not None and can_query(user_id):
+            set_product_price_by_root(
+                group_id,
+                root_image_message_id,
+                price_value,
+            )
+            continue
+
+        parsed = parse_order_text(text_value)
+
+        if not parsed:
+            # Non-order replies are still remembered above so deeper replies can be traced.
+            continue
+
+        pending = get_pending_image(
+            group_id,
+            root_image_message_id,
+        )
+
         product = get_product_by_image(
-            quoted_message_id
+            root_image_message_id
         )
 
         created_now = False
@@ -2624,7 +2753,7 @@ def webhook():
             # 建立商品後再通知 Owner，第一筆規格會直接顯示在卡片裡。
             if created_now:
                 product = get_product_by_image(
-                    quoted_message_id
+                    root_image_message_id
                 )
                 notify_owner_product_created(
                     product
