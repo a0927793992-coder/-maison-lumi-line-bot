@@ -70,6 +70,19 @@ def init_db():
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS staff (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS staff_invites (
+            code TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            used_by TEXT,
+            used_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             product_id INTEGER NOT NULL,
@@ -125,6 +138,96 @@ def get_admin_user_id():
 def is_admin(user_id):
     admin_id = get_admin_user_id()
     return bool(admin_id and user_id and admin_id == user_id)
+
+
+
+def is_staff(user_id):
+    if not user_id:
+        return False
+    with db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM staff WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    return bool(row)
+
+
+def can_manage_orders(user_id):
+    return is_admin(user_id) or is_staff(user_id)
+
+
+def generate_staff_invite():
+    # Six-digit one-time code.
+    for _ in range(20):
+        code = f"{secrets.randbelow(1000000):06d}"
+        try:
+            with db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO staff_invites(code, created_at)
+                    VALUES(?, ?)
+                    """,
+                    (code, now_iso()),
+                )
+            return code
+        except sqlite3.IntegrityError:
+            continue
+    raise RuntimeError("Could not generate invite code")
+
+
+def redeem_staff_invite(code, user_id):
+    with db() as conn:
+        invite = conn.execute(
+            """
+            SELECT *
+            FROM staff_invites
+            WHERE code=? AND used_by IS NULL
+            """,
+            (code,),
+        ).fetchone()
+
+        if not invite:
+            return False
+
+        conn.execute(
+            """
+            UPDATE staff_invites
+            SET used_by=?, used_at=?
+            WHERE code=? AND used_by IS NULL
+            """,
+            (user_id, now_iso(), code),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO staff(user_id, display_name, created_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (user_id, None, now_iso()),
+        )
+
+    return True
+
+
+def staff_list_text():
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, display_name, created_at
+            FROM staff
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+
+    if not rows:
+        return "目前沒有小幫手。"
+
+    lines = ["👥 小幫手列表"]
+    for i, row in enumerate(rows, start=1):
+        name = row["display_name"] or f"小幫手 #{short_code(row['user_id'])}"
+        lines.append(f"{i}. {name}")
+    return "\n".join(lines)
 
 
 def verify_signature(raw_body, signature):
@@ -198,6 +301,36 @@ def push_text(user_id, text):
         user_id,
         [{"type": "text", "text": text[:5000]}],
     )
+
+
+
+def get_user_profile(user_id):
+    if not CHANNEL_ACCESS_TOKEN or not user_id:
+        return None
+    try:
+        r = requests.get(
+            f"https://api.line.me/v2/bot/profile/{user_id}",
+            headers=auth_headers(),
+            timeout=10,
+        )
+        if r.ok:
+            return r.json()
+    except requests.RequestException:
+        pass
+    return None
+
+
+def refresh_staff_name(user_id):
+    if not is_staff(user_id):
+        return
+    profile = get_user_profile(user_id)
+    name = (profile or {}).get("displayName")
+    if name:
+        with db() as conn:
+            conn.execute(
+                "UPDATE staff SET display_name=? WHERE user_id=?",
+                (name, user_id),
+            )
 
 
 def get_group_profile(group_id, user_id):
@@ -907,7 +1040,48 @@ def webhook():
                 )
                 continue
 
-            if not is_admin(user_id):
+            join_match = re.match(
+                r"^\s*加入小幫手\s+(\d{6})\s*$",
+                text,
+            )
+
+            if join_match:
+                if redeem_staff_invite(join_match.group(1), user_id):
+                    refresh_staff_name(user_id)
+                    reply_text(
+                        reply_token,
+                        "✅ 已加入成為小幫手。\n"
+                        "現在可以使用：A001 查單 / A001 結單 / A001 開單 / 商品列表",
+                    )
+                else:
+                    reply_text(
+                        reply_token,
+                        "⚠️ 邀請碼無效或已經使用過。",
+                    )
+                continue
+
+            if text == "產生小幫手邀請碼":
+                if not is_admin(user_id):
+                    reply_text(reply_token, "⚠️ 只有 Owner 可以產生小幫手邀請碼。")
+                    continue
+
+                invite_code = generate_staff_invite()
+                reply_text(
+                    reply_token,
+                    f"👥 小幫手一次性邀請碼：{invite_code}\n\n"
+                    f"請小幫手加官方帳號好友後，私訊：\n加入小幫手 {invite_code}\n\n"
+                    "此邀請碼只能使用一次。",
+                )
+                continue
+
+            if text == "小幫手列表":
+                if not is_admin(user_id):
+                    reply_text(reply_token, "⚠️ 只有 Owner 可以查看小幫手列表。")
+                    continue
+                reply_text(reply_token, staff_list_text())
+                continue
+
+            if not can_manage_orders(user_id):
                 continue
 
             if PRODUCT_LIST_RE.match(text):
@@ -926,7 +1100,12 @@ def webhook():
                     "A001 查單\n"
                     "A001 結單\n"
                     "A001 開單\n"
-                    "商品列表",
+                    "商品列表\n"
+                    + (
+                        "產生小幫手邀請碼\n小幫手列表"
+                        if is_admin(user_id)
+                        else ""
+                    ),
                 )
                 continue
 
