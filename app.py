@@ -8,6 +8,7 @@ import sqlite3
 import string
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote_plus, unquote_plus
 
 import requests
 from flask import Flask, request, abort, jsonify, Response
@@ -46,6 +47,9 @@ AUTO_SESSION_PLACE_FIRST_RE = re.compile(
 END_SESSION_RE = re.compile(r"^\s*結束連線(?:\s+(.+?))?\s*$")
 JOIN_STAFF_RE = re.compile(r"^\s*加入小幫手\s+(\d{6})\s*$")
 PRODUCT_LIST_RE = re.compile(r"^\s*(商品列表|商品清單)\s*$")
+PROCUREMENT_WAITING_RE = re.compile(r"^\s*待採購清單\s*$")
+PROCUREMENT_PURCHASED_RE = re.compile(r"^\s*已採購清單\s*$")
+PROCUREMENT_OVERVIEW_RE = re.compile(r"^\s*採購總覽\s*$")
 STAFF_LIST_RE = re.compile(r"^\s*小幫手列表\s*$")
 INVITE_RE = re.compile(r"^\s*產生小幫手邀請碼\s*$")
 
@@ -160,6 +164,15 @@ def init_db():
             group_id TEXT PRIMARY KEY,
             last_alert_at_ms INTEGER NOT NULL,
             last_alert_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS procurement_items (
+            product_id INTEGER NOT NULL,
+            spec_name TEXT NOT NULL,
+            purchased_qty INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(product_id, spec_name),
+            FOREIGN KEY(product_id) REFERENCES products(id)
         );
         """)
 
@@ -1266,6 +1279,130 @@ def order_summary(product_id):
     )
 
 
+# ---------- Procurement tracking ----------
+
+def get_spec_required_qty(product_id, spec_name):
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(quantity), 0) AS qty
+            FROM order_items
+            WHERE product_id=? AND spec_name=? AND quantity>0
+            """,
+            (product_id, spec_name),
+        ).fetchone()
+    return int(row["qty"] if row else 0)
+
+
+def get_purchased_qty(product_id, spec_name):
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT purchased_qty
+            FROM procurement_items
+            WHERE product_id=? AND spec_name=?
+            """,
+            (product_id, spec_name),
+        ).fetchone()
+    return int(row["purchased_qty"] if row else 0)
+
+
+def set_purchased_qty(product_id, spec_name, qty):
+    required = get_spec_required_qty(product_id, spec_name)
+    qty = max(0, min(int(qty), required))
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO procurement_items(
+                product_id, spec_name, purchased_qty, updated_at
+            )
+            VALUES(?,?,?,?)
+            ON CONFLICT(product_id, spec_name)
+            DO UPDATE SET
+                purchased_qty=excluded.purchased_qty,
+                updated_at=excluded.updated_at
+            """,
+            (product_id, spec_name, qty, now_iso()),
+        )
+    return qty, required
+
+
+def change_purchased_qty(product_id, spec_name, delta):
+    current = get_purchased_qty(product_id, spec_name)
+    return set_purchased_qty(
+        product_id,
+        spec_name,
+        current + int(delta),
+    )
+
+
+def procurement_summary(product_id, spec_totals):
+    result = {}
+    purchased_total = 0
+    waiting_total = 0
+
+    for spec_name, required in spec_totals.items():
+        purchased = min(
+            get_purchased_qty(product_id, spec_name),
+            required,
+        )
+        waiting = max(required - purchased, 0)
+        result[spec_name] = {
+            "required": required,
+            "purchased": purchased,
+            "waiting": waiting,
+        }
+        purchased_total += purchased
+        waiting_total += waiting
+
+    return result, purchased_total, waiting_total
+
+
+def procurement_buttons(product, spec_name):
+    encoded_spec = quote_plus(spec_name)
+    base = f"product_id={product['id']}&spec={encoded_spec}"
+
+    return {
+        "type": "box",
+        "layout": "horizontal",
+        "spacing": "sm",
+        "margin": "sm",
+        "contents": [
+            {
+                "type": "button",
+                "style": "secondary",
+                "height": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": "－1",
+                    "data": f"action=procure_minus&{base}",
+                },
+            },
+            {
+                "type": "button",
+                "style": "primary",
+                "height": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": "入單 +1",
+                    "data": f"action=procure_plus&{base}",
+                },
+            },
+            {
+                "type": "button",
+                "style": "secondary",
+                "height": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": "全數入單",
+                    "data": f"action=procure_all&{base}",
+                },
+            },
+        ],
+    }
+
+
 # ---------- Flex cards ----------
 
 def short_code(user_id):
@@ -1313,6 +1450,11 @@ def build_product_card(product, viewer_user_id, title=None):
         people_count,
         total_qty,
     ) = order_summary(product["id"])
+
+    procurement, purchased_total, waiting_total = procurement_summary(
+        product["id"],
+        spec_totals,
+    )
 
     name_counts = Counter(
         (
@@ -1445,28 +1587,45 @@ def build_product_card(product, viewer_user_id, title=None):
             spec_totals.items(),
             key=lambda x: x[0],
         ):
+            status = procurement.get(
+                spec_name,
+                {"required": qty, "purchased": 0, "waiting": qty},
+            )
+
             body.append({
                 "type": "box",
-                "layout": "horizontal",
-                "margin": "sm",
+                "layout": "vertical",
+                "margin": "md",
                 "contents": [
                     {
                         "type": "text",
                         "text": spec_name,
                         "size": "sm",
-                        "flex": 1,
+                        "weight": "bold",
                         "wrap": True,
                     },
                     {
                         "type": "text",
-                        "text": f"× {qty}",
-                        "size": "sm",
-                        "weight": "bold",
-                        "align": "end",
-                        "flex": 0,
+                        "text": (
+                            f"需求 {status['required']} ｜ "
+                            f"✅ 已購 {status['purchased']} ｜ "
+                            f"🛒 待購 {status['waiting']}"
+                        ),
+                        "size": "xs",
+                        "color": "#555555",
+                        "margin": "xs",
+                        "wrap": True,
                     },
                 ],
             })
+
+            if can_query(viewer_user_id):
+                body.append(
+                    procurement_buttons(
+                        product,
+                        spec_name,
+                    )
+                )
     else:
         body.append({
             "type": "text",
@@ -1482,19 +1641,27 @@ def build_product_card(product, viewer_user_id, title=None):
             "margin": "lg",
         },
         {
+            "type": "text",
+            "text": f"👥 {people_count} 人 ｜ 📦 訂購總數 {total_qty}",
+            "size": "sm",
+            "margin": "lg",
+            "wrap": True,
+        },
+        {
             "type": "box",
             "layout": "horizontal",
-            "margin": "lg",
+            "margin": "sm",
             "contents": [
                 {
                     "type": "text",
-                    "text": f"👥 {people_count} 人",
+                    "text": f"✅ 已購 {purchased_total}",
                     "size": "sm",
+                    "weight": "bold",
                     "flex": 1,
                 },
                 {
                     "type": "text",
-                    "text": f"📦 總數 {total_qty}",
+                    "text": f"🛒 待購 {waiting_total}",
                     "size": "sm",
                     "weight": "bold",
                     "align": "end",
@@ -1606,6 +1773,291 @@ def product_list_text():
     return "\n".join(lines)
 
 
+def procurement_list_text(mode="waiting"):
+    """Build a session-wide procurement report for Owner/staff private chat."""
+    session = get_active_session()
+
+    # If the session was just ended, still allow checking the most recent session.
+    if not session:
+        with db() as conn:
+            session = conn.execute(
+                """
+                SELECT * FROM sessions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+    if not session:
+        return "目前還沒有任何連線紀錄。"
+
+    with db() as conn:
+        products = conn.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE session_id=?
+            ORDER BY id ASC
+            """,
+            (session["id"],),
+        ).fetchall()
+
+    if not products:
+        return (
+            f"📍 {session['session_code']}\n"
+            "目前還沒有成立的商品。"
+        )
+
+    if mode == "waiting":
+        title = "🛒 待採購清單"
+    elif mode == "purchased":
+        title = "✅ 已採購清單"
+    else:
+        title = "📊 採購總覽"
+
+    lines = [title, f"📍 {session['session_code']}", ""]
+    grand_required = 0
+    grand_purchased = 0
+    grand_waiting = 0
+    shown_rows = 0
+
+    for product in products:
+        _, _, spec_totals, _, _ = order_summary(product["id"])
+        if not spec_totals:
+            continue
+
+        procurement, purchased_total, waiting_total = procurement_summary(
+            product["id"],
+            spec_totals,
+        )
+
+        grand_required += sum(spec_totals.values())
+        grand_purchased += purchased_total
+        grand_waiting += waiting_total
+
+        product_lines = []
+        for spec_name, status in sorted(procurement.items(), key=lambda x: x[0]):
+            if mode == "waiting" and status["waiting"] <= 0:
+                continue
+            if mode == "purchased" and status["purchased"] <= 0:
+                continue
+
+            if mode == "waiting":
+                detail = (
+                    f"・{spec_name}：待購 {status['waiting']}"
+                    f"（需求 {status['required']}／已購 {status['purchased']}）"
+                )
+            elif mode == "purchased":
+                detail = (
+                    f"・{spec_name}：已購 {status['purchased']}"
+                    f"（需求 {status['required']}／待購 {status['waiting']}）"
+                )
+            else:
+                detail = (
+                    f"・{spec_name}：需求 {status['required']}｜"
+                    f"已購 {status['purchased']}｜待購 {status['waiting']}"
+                )
+
+            product_lines.append(detail)
+            shown_rows += 1
+
+        if product_lines:
+            lines.append(f"【{product['product_code']}】")
+            lines.extend(product_lines)
+            lines.append("")
+
+    if shown_rows == 0:
+        if mode == "waiting":
+            return (
+                f"🎉 {session['session_code']}\n"
+                "目前全部都已經採購完成，沒有待採購商品。"
+            )
+        if mode == "purchased":
+            return (
+                f"📍 {session['session_code']}\n"
+                "目前還沒有標記任何已採購商品。"
+            )
+        return (
+            f"📍 {session['session_code']}\n"
+            "目前沒有可顯示的採購資料。"
+        )
+
+    lines.extend([
+        "──────────",
+        f"📦 需求總數：{grand_required}",
+        f"✅ 已購總數：{grand_purchased}",
+        f"🛒 待購總數：{grand_waiting}",
+    ])
+
+    # LINE text messages have a 5,000-character limit.
+    text = "\n".join(lines)
+    if len(text) > 4900:
+        text = text[:4850] + "\n…清單過長，請用商品編號查單查看其餘內容。"
+    return text
+
+
+def build_end_session_product_bubble(product):
+    """Compact procurement bubble used in the end-of-session image summary."""
+    _, _, spec_totals, _, _ = order_summary(product["id"])
+    procurement, purchased_total, waiting_total = procurement_summary(
+        product["id"],
+        spec_totals,
+    )
+    required_total = sum(spec_totals.values())
+
+    body = [
+        {
+            "type": "text",
+            "text": product["product_code"],
+            "weight": "bold",
+            "size": "lg",
+            "wrap": True,
+        },
+        {
+            "type": "text",
+            "text": (
+                f"📦 需求 {required_total}  ｜  "
+                f"✅ 已購 {purchased_total}  ｜  "
+                f"🛒 待購 {waiting_total}"
+            ),
+            "size": "xs",
+            "color": "#666666",
+            "margin": "sm",
+            "wrap": True,
+        },
+        {
+            "type": "separator",
+            "margin": "md",
+        },
+    ]
+
+    if procurement:
+        for spec_name, status in sorted(procurement.items(), key=lambda x: x[0]):
+            body.extend([
+                {
+                    "type": "text",
+                    "text": f"・{spec_name}",
+                    "size": "sm",
+                    "weight": "bold",
+                    "margin": "md",
+                    "wrap": True,
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"喊單 +{status['required']}  ｜  "
+                        f"採購 {status['purchased']}  ｜  "
+                        f"待購 {status['waiting']}"
+                    ),
+                    "size": "xs",
+                    "color": "#555555",
+                    "margin": "xs",
+                    "wrap": True,
+                },
+            ])
+    else:
+        body.append({
+            "type": "text",
+            "text": "目前沒有喊單資料",
+            "size": "sm",
+            "color": "#777777",
+            "margin": "md",
+        })
+
+    bubble = {
+        "type": "bubble",
+        "size": "kilo",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": body,
+        },
+    }
+
+    image_url = product_image_url(product)
+    if image_url:
+        bubble["hero"] = {
+            "type": "image",
+            "url": image_url,
+            "size": "full",
+            "aspectRatio": "1:1",
+            "aspectMode": "cover",
+        }
+
+    return bubble
+
+
+def build_end_session_messages(session):
+    """Return up to five LINE messages: image carousels plus a session total."""
+    with db() as conn:
+        products = conn.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE session_id=?
+            ORDER BY id ASC
+            """,
+            (session["id"],),
+        ).fetchall()
+
+    grand_required = 0
+    grand_purchased = 0
+    grand_waiting = 0
+    eligible = []
+
+    for product in products:
+        _, _, spec_totals, _, _ = order_summary(product["id"])
+        if not spec_totals:
+            continue
+        _, purchased_total, waiting_total = procurement_summary(
+            product["id"],
+            spec_totals,
+        )
+        grand_required += sum(spec_totals.values())
+        grand_purchased += purchased_total
+        grand_waiting += waiting_total
+        eligible.append(product)
+
+    summary_text = (
+        f"✅ 已結束 {session['session_code']}\n\n"
+        "📋 結束連線總計\n"
+        f"📦 喊單總數：{grand_required}\n"
+        f"✅ 已採購：{grand_purchased}\n"
+        f"🛒 待採購：{grand_waiting}"
+    )
+
+    if not eligible:
+        return [{"type": "text", "text": summary_text + "\n\n目前沒有成立的商品。"}]
+
+    # LINE reply API allows at most 5 messages. Reserve one for the text total,
+    # so up to four carousels are emitted. Each carousel contains at most 10 products.
+    visible = eligible[:40]
+    messages = []
+    for start in range(0, len(visible), 10):
+        chunk = visible[start:start + 10]
+        messages.append({
+            "type": "flex",
+            "altText": f"{session['session_code']} 結束連線商品總表",
+            "contents": {
+                "type": "carousel",
+                "contents": [
+                    build_end_session_product_bubble(product)
+                    for product in chunk
+                ],
+            },
+        })
+
+    if len(eligible) > len(visible):
+        summary_text += (
+            f"\n\n⚠️ 本場共有 {len(eligible)} 個商品，"
+            f"圖片總表先顯示前 {len(visible)} 個；"
+            "其餘可輸入「採購總覽」查看。"
+        )
+
+    messages.append({"type": "text", "text": summary_text[:5000]})
+    return messages[:5]
+
+
 # ---------- Routes ----------
 
 @app.get("/")
@@ -1613,7 +2065,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "13-mass-leave-private-alert",
+        "version": "14-procurement-tracking",
     })
 
 
@@ -1707,6 +2159,72 @@ def webhook():
                 reply_text(reply_token, "找不到這個商品。")
                 continue
 
+            if action in (
+                "procure_plus",
+                "procure_minus",
+                "procure_all",
+            ):
+                if not can_query(user_id):
+                    continue
+
+                spec_name = unquote_plus(
+                    params.get("spec", "")
+                ).strip()
+
+                if not spec_name:
+                    reply_text(
+                        reply_token,
+                        "找不到這個規格。",
+                    )
+                    continue
+
+                required = get_spec_required_qty(
+                    product["id"],
+                    spec_name,
+                )
+
+                if required <= 0:
+                    reply_text(
+                        reply_token,
+                        "這個規格目前沒有待採購數量。",
+                    )
+                    continue
+
+                if action == "procure_plus":
+                    change_purchased_qty(
+                        product["id"],
+                        spec_name,
+                        1,
+                    )
+                elif action == "procure_minus":
+                    change_purchased_qty(
+                        product["id"],
+                        spec_name,
+                        -1,
+                    )
+                else:
+                    set_purchased_qty(
+                        product["id"],
+                        spec_name,
+                        required,
+                    )
+
+                product = get_product_by_code(
+                    product["product_code"]
+                )
+
+                reply_messages(
+                    reply_token,
+                    [
+                        build_product_card(
+                            product,
+                            user_id,
+                            title=f"🛒 {product['product_code']} 採購進度",
+                        )
+                    ],
+                )
+                continue
+
             if action == "query":
                 if not can_query(user_id):
                     continue
@@ -1792,7 +2310,7 @@ def webhook():
                     reply_text(
                         reply_token,
                         "✅ 已加入成為小幫手。\n"
-                        "小幫手僅有查單權限。",
+                        "小幫手可以查單與更新採購進度。",
                     )
                 else:
                     reply_text(
@@ -1866,9 +2384,18 @@ def webhook():
                         "目前沒有進行中的連線。",
                     )
                 else:
-                    reply_text(
+                    overview = procurement_list_text("overview")
+                    if overview.startswith("📊 採購總覽"):
+                        overview = overview.replace(
+                            "📊 採購總覽",
+                            "📋 結束連線總表",
+                            1,
+                        )
+
+                    # 結束連線時回傳「商品照片卡 + 規格採購進度 + 整場總計」。
+                    reply_messages(
                         reply_token,
-                        f"✅ 已結束 {session['session_code']}",
+                        build_end_session_messages(session),
                     )
                 continue
 
@@ -1879,6 +2406,33 @@ def webhook():
                 reply_text(
                     reply_token,
                     product_list_text(),
+                )
+                continue
+
+            if PROCUREMENT_WAITING_RE.match(text):
+                if not can_query(user_id):
+                    continue
+                reply_text(
+                    reply_token,
+                    procurement_list_text("waiting"),
+                )
+                continue
+
+            if PROCUREMENT_PURCHASED_RE.match(text):
+                if not can_query(user_id):
+                    continue
+                reply_text(
+                    reply_token,
+                    procurement_list_text("purchased"),
+                )
+                continue
+
+            if PROCUREMENT_OVERVIEW_RE.match(text):
+                if not can_query(user_id):
+                    continue
+                reply_text(
+                    reply_token,
+                    procurement_list_text("overview"),
                 )
                 continue
 
@@ -1950,13 +2504,21 @@ def webhook():
                     "或：開始連線 8/18-19 香港\n"
                     "結束連線\n"
                     "商品列表\n"
+                    "待採購清單\n"
+                    "已採購清單\n"
+                    "採購總覽\n"
                     "產生小幫手邀請碼\n"
                     "小幫手列表",
                 )
             elif is_staff(user_id):
                 reply_text(
                     reply_token,
-                    "小幫手可使用：\n商品列表\n或點商品卡的「查單」。",
+                    "小幫手可使用：\n"
+                    "商品列表\n"
+                    "待採購清單\n"
+                    "已採購清單\n"
+                    "採購總覽\n"
+                    "或點商品卡的「查單／採購按鈕」。",
                 )
 
             continue
