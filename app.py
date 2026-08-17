@@ -42,7 +42,13 @@ JOIN_STAFF_RE = re.compile(r"^\s*加入小幫手\s+(\d{6})\s*$")
 PRODUCT_LIST_RE = re.compile(r"^\s*(商品列表|商品清單)\s*$")
 STAFF_LIST_RE = re.compile(r"^\s*小幫手列表\s*$")
 INVITE_RE = re.compile(r"^\s*產生小幫手邀請碼\s*$")
-SESSION_DATE_LOOKUP_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})\s*$")
+SESSION_LOOKUP_RE = re.compile(
+    r"^\s*(?:"
+    r"(?P<date_first>\d{1,2}/\d{1,2})(?:\s*(?P<place_after>[^\d/].*?))?"
+    r"|"
+    r"(?P<place_before>[^\d/].*?)\s*(?P<date_after>\d{1,2}/\d{1,2})"
+    r")\s*$"
+)
 
 
 def now_iso():
@@ -1609,35 +1615,70 @@ def notify_owner_product_created(product):
 
 
 
-def find_session_by_date(month, day):
-    """Owner / 小幫手私訊 8/16，找到該日期連線場次。"""
+def find_session_for_lookup(text):
+    """
+    支援小幫手 / Owner：
+      8/16
+      8/16香港
+      8/16 香港
+      香港8/16
+      香港 8/16
+
+    只有日期時：優先目前進行中的同日期場次。
+    有地區時：優先找同日期 + 地區的場次。
+    """
+    text = (text or "").strip()
+    match = SESSION_LOOKUP_RE.match(text)
+
+    if not match:
+        return None
+
+    date_text = match.group("date_first") or match.group("date_after")
+    place = (
+        match.group("place_after")
+        or match.group("place_before")
+        or ""
+    ).strip()
+
+    month, day = date_text.split("/", 1)
     prefix = f"{int(month):02d}{int(day):02d}"
 
     with db() as conn:
-        active = conn.execute(
-            """
-            SELECT *
-            FROM sessions
-            WHERE is_active=1
-              AND session_code LIKE ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (prefix + "%",),
-        ).fetchone()
-
-        if active:
-            return active
-
-        return conn.execute(
+        rows = conn.execute(
             """
             SELECT *
             FROM sessions
             WHERE session_code LIKE ?
-            ORDER BY id DESC
-            LIMIT 1
+            ORDER BY is_active DESC, id DESC
             """,
             (prefix + "%",),
+        ).fetchall()
+
+    if not rows:
+        return None
+
+    if place:
+        compact_place = re.sub(r"\s+", "", place)
+        for row in rows:
+            if compact_place in row["session_code"]:
+                return row
+
+    return rows[0]
+
+
+def get_current_session_for_cards():
+    session = get_active_session()
+    if session:
+        return session
+
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM sessions
+            ORDER BY id DESC
+            LIMIT 1
+            """
         ).fetchone()
 
 
@@ -1811,7 +1852,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "15-procurement-tracking",
+        "version": "16-helper-product-card-shortcuts",
     })
 
 
@@ -2144,30 +2185,42 @@ def webhook():
                 )
                 continue
 
-            # Owner / 小幫手輸入 8/16，可直接查看該日期場次商品。
-            date_lookup = SESSION_DATE_LOOKUP_RE.match(text)
-            if date_lookup and can_query(user_id):
-                session = find_session_by_date(
-                    date_lookup.group(1),
-                    date_lookup.group(2),
-                )
+            # Owner / 小幫手：輸入日期、日期+地區、查單、入單、商品列表
+            # 都可以直接叫出商品卡。
+            if can_query(user_id):
+                lookup_session = find_session_for_lookup(text)
 
-                if not session:
-                    reply_text(
-                        reply_token,
-                        f"找不到 {int(date_lookup.group(1))}/{int(date_lookup.group(2))} 的連線場次。",
-                    )
-                else:
+                if lookup_session:
                     reply_messages(
                         reply_token,
                         [
                             build_session_products_carousel(
-                                session,
+                                lookup_session,
                                 user_id,
                             )
                         ],
                     )
-                continue
+                    continue
+
+                if text in ("查單", "入單", "商品列表", "商品清單"):
+                    session = get_current_session_for_cards()
+
+                    if not session:
+                        reply_text(
+                            reply_token,
+                            "目前找不到可查看的連線場次。",
+                        )
+                    else:
+                        reply_messages(
+                            reply_token,
+                            [
+                                build_session_products_carousel(
+                                    session,
+                                    user_id,
+                                )
+                            ],
+                        )
+                    continue
 
             if text in ("待拿", "未採購", "還沒買"):
                 if can_query(user_id):
@@ -2308,7 +2361,7 @@ def webhook():
             elif is_staff(user_id):
                 reply_text(
                     reply_token,
-                    "小幫手可使用：\n8/16 → 查看該日期連線商品\n商品列表\n待拿\n商品卡「查單」\n商品卡「入單」",
+                    "小幫手可使用：\n8/16、8/16香港、香港8/16 → 商品卡\n查單／入單／商品列表 → 目前場次商品卡\n待拿 → 尚未拿齊商品\n商品卡「查單」／「入單」",
                 )
 
             continue
