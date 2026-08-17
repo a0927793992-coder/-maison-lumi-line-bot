@@ -8,6 +8,7 @@ import sqlite3
 import string
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from urllib.parse import quote_plus, unquote_plus
 
 import requests
 from flask import Flask, request, abort, jsonify, Response
@@ -1344,7 +1345,94 @@ def product_action_buttons(product, viewer_user_id):
     return buttons
 
 
-def build_product_card(product, viewer_user_id, title=None):
+def _short_button_label(spec_name):
+    text = f"{spec_name} +1"
+    return text if len(text) <= 20 else text[:19] + "…"
+
+
+def product_procurement_buttons(product, viewer_user_id):
+    buttons = [
+        {
+            "type": "button",
+            "style": "primary",
+            "height": "sm",
+            "action": {
+                "type": "postback",
+                "label": "查單",
+                "data": f"action=query&product_id={product['id']}",
+                "displayText": f"{product['product_code']} 查單",
+            },
+        }
+    ]
+
+    if can_query(viewer_user_id):
+        (
+            spec_totals,
+            purchased,
+            waiting_by_spec,
+            ordered_total,
+            purchased_total,
+            waiting_total,
+        ) = procurement_summary(product["id"])
+
+        pending_specs = [
+            (spec_name, int(waiting_qty))
+            for spec_name, waiting_qty in waiting_by_spec.items()
+            if int(waiting_qty) > 0
+        ]
+
+        # 按規格顯示按鈕，讓採購入單直接按
+        for spec_name, waiting_qty in sorted(pending_specs, key=lambda x: (x[0])):
+            buttons.append({
+                "type": "button",
+                "style": "secondary",
+                "height": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": _short_button_label(spec_name),
+                    "data": (
+                        f"action=procure_add&product_id={product['id']}"
+                        f"&spec={quote_plus(spec_name)}"
+                    ),
+                    "displayText": f"{product['product_code']} {spec_name}+1",
+                },
+            })
+
+        if waiting_total <= 0:
+            buttons.append({
+                "type": "button",
+                "style": "secondary",
+                "height": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": "已拿完",
+                    "data": f"action=query&product_id={product['id']}",
+                    "displayText": f"{product['product_code']} 查單",
+                },
+            })
+
+    if is_owner(viewer_user_id):
+        buttons.append({
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "postback",
+                "label": "結單",
+                "data": f"action=close&product_id={product['id']}",
+                "displayText": f"{product['product_code']} 結單",
+            },
+        })
+
+    return buttons
+
+
+def build_product_card(
+    product,
+    viewer_user_id,
+    title=None,
+    procurement_mode=False,
+):
     (
         rows,
         per_user,
@@ -1517,12 +1605,72 @@ def build_product_card(product, viewer_user_id, title=None):
 
     (
         _,
-        _,
+        purchased,
         waiting_by_spec,
         ordered_total,
         purchased_total,
         waiting_total,
     ) = procurement_summary(product["id"])
+
+    body.extend([
+        {
+            "type": "separator",
+            "margin": "lg",
+        },
+        {
+            "type": "text",
+            "text": "🛒 規格進度",
+            "weight": "bold",
+            "size": "sm",
+            "margin": "lg",
+        },
+    ])
+
+    if spec_totals:
+        for spec_name, ordered_qty in sorted(
+            spec_totals.items(),
+            key=lambda x: x[0],
+        ):
+            got_qty = min(
+                int(purchased.get(spec_name, 0)),
+                int(ordered_qty),
+            )
+            waiting_qty = int(waiting_by_spec.get(spec_name, 0))
+
+            body.append({
+                "type": "box",
+                "layout": "vertical",
+                "margin": "md",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": spec_name,
+                        "size": "sm",
+                        "weight": "bold",
+                        "wrap": True,
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            f"已喊 {ordered_qty}｜"
+                            f"已拿 {got_qty}｜"
+                            f"待拿 {waiting_qty}"
+                        ),
+                        "size": "xs",
+                        "color": "#555555",
+                        "margin": "sm",
+                        "wrap": True,
+                    },
+                ],
+            })
+    else:
+        body.append({
+            "type": "text",
+            "text": "尚無採購資料",
+            "size": "xs",
+            "color": "#777777",
+            "margin": "sm",
+        })
 
     body.extend([
         {
@@ -1552,13 +1700,32 @@ def build_product_card(product, viewer_user_id, title=None):
         },
         {
             "type": "text",
-            "text": f"🛒 已喊 {ordered_total}｜已拿 {purchased_total}｜待拿 {waiting_total}",
+            "text": f"🛒 已喊 {ordered_total}",
             "size": "sm",
             "weight": "bold",
             "margin": "md",
-            "wrap": True,
+        },
+        {
+            "type": "text",
+            "text": f"✅ 已拿 {purchased_total}",
+            "size": "sm",
+            "weight": "bold",
+            "margin": "sm",
+        },
+        {
+            "type": "text",
+            "text": f"⏳ 待拿 {waiting_total}",
+            "size": "sm",
+            "weight": "bold",
+            "margin": "sm",
         },
     ])
+
+    footer_buttons = (
+        product_procurement_buttons(product, viewer_user_id)
+        if procurement_mode
+        else product_action_buttons(product, viewer_user_id)
+    )
 
     bubble = {
         "type": "bubble",
@@ -1572,10 +1739,7 @@ def build_product_card(product, viewer_user_id, title=None):
             "type": "box",
             "layout": "vertical",
             "spacing": "sm",
-            "contents": product_action_buttons(
-                product,
-                viewer_user_id,
-            ),
+            "contents": footer_buttons,
         },
     }
 
@@ -1852,7 +2016,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "16-helper-product-card-shortcuts",
+        "version": "17-button-procurement-spec-breakdown",
     })
 
 
@@ -1964,9 +2128,65 @@ def webhook():
                     product["id"],
                 )
 
-                reply_text(
+                reply_messages(
                     reply_token,
-                    procurement_prompt_text(product),
+                    [
+                        build_product_card(
+                            product,
+                            user_id,
+                            title=f"📦 {product['product_code']} 採購進度",
+                            procurement_mode=True,
+                        )
+                    ],
+                )
+                continue
+
+            if action == "procure_add":
+                if not can_query(user_id):
+                    continue
+
+                spec_name = unquote_plus(
+                    params.get("spec", "")
+                ).strip()
+
+                if spec_name:
+                    add_procurement(
+                        product["id"],
+                        spec_name,
+                        1,
+                    )
+
+                product = get_product_by_code(
+                    product["product_code"]
+                )
+
+                (
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    waiting_total,
+                ) = procurement_summary(product["id"])
+
+                if waiting_total <= 0:
+                    clear_procurement_state(user_id)
+                else:
+                    set_procurement_state(
+                        user_id,
+                        product["id"],
+                    )
+
+                reply_messages(
+                    reply_token,
+                    [
+                        build_product_card(
+                            product,
+                            user_id,
+                            title=f"📦 {product['product_code']} 採購進度",
+                            procurement_mode=True,
+                        )
+                    ],
                 )
                 continue
 
