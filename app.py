@@ -1651,12 +1651,20 @@ def notify_live_order_update(product):
 
 def build_final_product_bubble(product):
     (
-        _,
-        _,
+        rows,
+        per_user,
         spec_totals,
         people_count,
         total_qty,
     ) = order_summary(product["id"])
+
+    name_counts = Counter(
+        (
+            items[0]["display_name"]
+            or "未知會員"
+        )
+        for items in per_user.values()
+    )
 
     body = [
         {
@@ -1677,7 +1685,83 @@ def build_final_product_bubble(product):
             "type": "separator",
             "margin": "md",
         },
+        {
+            "type": "text",
+            "text": "喊單人",
+            "weight": "bold",
+            "size": "sm",
+            "margin": "md",
+        },
     ]
+
+    if per_user:
+        for user_id, items in per_user.items():
+            display_name = (
+                items[0]["display_name"]
+                or "未知會員"
+            )
+
+            if name_counts[display_name] > 1:
+                display_name = (
+                    f"{display_name} "
+                    f"#{short_code(user_id)}"
+                )
+
+            body.append({
+                "type": "text",
+                "text": display_name,
+                "size": "xs",
+                "weight": "bold",
+                "margin": "sm",
+                "wrap": True,
+            })
+
+            for item in items:
+                body.append({
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "xs",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": f"・{item['spec_name']}",
+                            "size": "xxs",
+                            "color": "#555555",
+                            "flex": 1,
+                            "wrap": True,
+                        },
+                        {
+                            "type": "text",
+                            "text": f"× {item['quantity']}",
+                            "size": "xxs",
+                            "weight": "bold",
+                            "align": "end",
+                            "flex": 0,
+                        },
+                    ],
+                })
+    else:
+        body.append({
+            "type": "text",
+            "text": "目前沒有喊單",
+            "size": "xs",
+            "color": "#777777",
+            "margin": "sm",
+        })
+
+    body.extend([
+        {
+            "type": "separator",
+            "margin": "md",
+        },
+        {
+            "type": "text",
+            "text": "規格總計",
+            "weight": "bold",
+            "size": "sm",
+            "margin": "md",
+        },
+    ])
 
     if spec_totals:
         for spec_name, qty in sorted(
@@ -1687,7 +1771,7 @@ def build_final_product_bubble(product):
             body.append({
                 "type": "box",
                 "layout": "horizontal",
-                "margin": "sm",
+                "margin": "xs",
                 "contents": [
                     {
                         "type": "text",
@@ -1706,14 +1790,6 @@ def build_final_product_bubble(product):
                     },
                 ],
             })
-    else:
-        body.append({
-            "type": "text",
-            "text": "0 件",
-            "size": "xs",
-            "color": "#777777",
-            "margin": "sm",
-        })
 
     bubble = {
         "type": "bubble",
@@ -1736,7 +1812,6 @@ def build_final_product_bubble(product):
         }
 
     return bubble
-
 
 def build_final_session_carousels(session):
     with db() as conn:
@@ -2179,75 +2254,6 @@ def build_product_card(
             "margin": "sm",
         })
 
-    (
-        _,
-        purchased,
-        waiting_by_spec,
-        ordered_total,
-        purchased_total,
-        waiting_total,
-    ) = procurement_summary(product["id"])
-
-    body.extend([
-        {
-            "type": "separator",
-            "margin": "lg",
-        },
-        {
-            "type": "text",
-            "text": "🛒 規格進度",
-            "weight": "bold",
-            "size": "sm",
-            "margin": "lg",
-        },
-    ])
-
-    if spec_totals:
-        for spec_name, ordered_qty in sorted(
-            spec_totals.items(),
-            key=lambda x: x[0],
-        ):
-            got_qty = min(
-                int(purchased.get(spec_name, 0)),
-                int(ordered_qty),
-            )
-            waiting_qty = int(waiting_by_spec.get(spec_name, 0))
-
-            body.append({
-                "type": "box",
-                "layout": "vertical",
-                "margin": "md",
-                "contents": [
-                    {
-                        "type": "text",
-                        "text": spec_name,
-                        "size": "sm",
-                        "weight": "bold",
-                        "wrap": True,
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"已喊 {ordered_qty}｜"
-                            f"已拿 {got_qty}｜"
-                            f"待拿 {waiting_qty}"
-                        ),
-                        "size": "xs",
-                        "color": "#555555",
-                        "margin": "sm",
-                        "wrap": True,
-                    },
-                ],
-            })
-    else:
-        body.append({
-            "type": "text",
-            "text": "尚無採購資料",
-            "size": "xs",
-            "color": "#777777",
-            "margin": "sm",
-        })
-
     body.extend([
         {
             "type": "separator",
@@ -2274,34 +2280,7 @@ def build_product_card(
                 },
             ],
         },
-        {
-            "type": "text",
-            "text": f"🛒 已喊 {ordered_total}",
-            "size": "sm",
-            "weight": "bold",
-            "margin": "md",
-        },
-        {
-            "type": "text",
-            "text": f"✅ 已拿 {purchased_total}",
-            "size": "sm",
-            "weight": "bold",
-            "margin": "sm",
-        },
-        {
-            "type": "text",
-            "text": f"⏳ 待拿 {waiting_total}",
-            "size": "sm",
-            "weight": "bold",
-            "margin": "sm",
-        },
     ])
-
-    footer_buttons = (
-        product_procurement_buttons(product, viewer_user_id)
-        if procurement_mode
-        else product_action_buttons(product, viewer_user_id)
-    )
 
     bubble = {
         "type": "bubble",
@@ -2315,7 +2294,10 @@ def build_product_card(
             "type": "box",
             "layout": "vertical",
             "spacing": "sm",
-            "contents": footer_buttons,
+            "contents": product_action_buttons(
+                product,
+                viewer_user_id,
+            ),
         },
     }
 
@@ -2334,7 +2316,6 @@ def build_product_card(
         "altText": f"{product['product_code']} 查單",
         "contents": bubble,
     }
-
 
 def notify_owner_product_created(product):
     owner_id = get_owner_user_id()
@@ -2592,7 +2573,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "19-live-cumulative-cards-final-carousel",
+        "version": "20-order-only-final-names",
     })
 
 
@@ -3163,14 +3144,6 @@ def webhook():
                             ],
                         )
                     continue
-
-            if text in ("待拿", "未採購", "還沒買"):
-                if can_query(user_id):
-                    reply_text(
-                        reply_token,
-                        outstanding_products_text(),
-                    )
-                continue
 
             start_match = START_SESSION_RE.match(text)
             auto_date_first = AUTO_SESSION_DATE_FIRST_RE.match(text)
