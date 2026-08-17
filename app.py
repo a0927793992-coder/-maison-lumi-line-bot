@@ -7,8 +7,7 @@ import secrets
 import sqlite3
 import string
 from collections import Counter, defaultdict
-from datetime import datetime, timezone, timedelta
-from urllib.parse import quote_plus, unquote_plus
+from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, abort, jsonify, Response
@@ -19,12 +18,6 @@ CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "maison_lumi.db")
 ADMIN_USER_ID_ENV = os.getenv("ADMIN_USER_ID", "").strip()
-
-# ---------- Anti-raid / mass-leave alert ----------
-LEAVE_ALERT_WINDOW_SECONDS = 30
-LEAVE_ALERT_THRESHOLD = 2
-LEAVE_ALERT_COOLDOWN_SECONDS = 30
-TAIPEI_TZ = timezone(timedelta(hours=8))
 
 PLUS_ONLY_RE = re.compile(r"^\s*\+(\d+)\s*$")
 SPEC_PLUS_RE = re.compile(r"^\s*(.+?)\s*\+(\d+)\s*$")
@@ -47,11 +40,9 @@ AUTO_SESSION_PLACE_FIRST_RE = re.compile(
 END_SESSION_RE = re.compile(r"^\s*結束連線(?:\s+(.+?))?\s*$")
 JOIN_STAFF_RE = re.compile(r"^\s*加入小幫手\s+(\d{6})\s*$")
 PRODUCT_LIST_RE = re.compile(r"^\s*(商品列表|商品清單)\s*$")
-PROCUREMENT_WAITING_RE = re.compile(r"^\s*待採購清單\s*$")
-PROCUREMENT_PURCHASED_RE = re.compile(r"^\s*已採購清單\s*$")
-PROCUREMENT_OVERVIEW_RE = re.compile(r"^\s*採購總覽\s*$")
 STAFF_LIST_RE = re.compile(r"^\s*小幫手列表\s*$")
 INVITE_RE = re.compile(r"^\s*產生小幫手邀請碼\s*$")
+SESSION_DATE_LOOKUP_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})\s*$")
 
 
 def now_iso():
@@ -90,6 +81,20 @@ def init_db():
             used_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS procurement_items (
+            product_id INTEGER NOT NULL,
+            spec_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(product_id, spec_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS procurement_states (
+            operator_user_id TEXT PRIMARY KEY,
+            product_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_name TEXT NOT NULL,
@@ -116,7 +121,6 @@ def init_db():
             sender_user_id TEXT,
             image_blob BLOB,
             image_mime TEXT,
-            price INTEGER,
             created_at TEXT NOT NULL
         );
 
@@ -132,7 +136,6 @@ def init_db():
             image_key TEXT,
             image_blob BLOB,
             image_mime TEXT,
-            price INTEGER,
             created_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES sessions(id)
         );
@@ -148,44 +151,6 @@ def init_db():
             UNIQUE(product_id, user_id, spec_name),
             FOREIGN KEY(product_id) REFERENCES products(id)
         );
-
-        CREATE TABLE IF NOT EXISTS group_leave_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT NOT NULL,
-            user_id TEXT,
-            webhook_event_id TEXT,
-            occurred_at_ms INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(webhook_event_id, user_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_group_leave_events_group_time
-        ON group_leave_events(group_id, occurred_at_ms);
-
-        CREATE TABLE IF NOT EXISTS leave_alert_state (
-            group_id TEXT PRIMARY KEY,
-            last_alert_at_ms INTEGER NOT NULL,
-            last_alert_count INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS procurement_items (
-            product_id INTEGER NOT NULL,
-            spec_name TEXT NOT NULL,
-            purchased_qty INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY(product_id, spec_name),
-            FOREIGN KEY(product_id) REFERENCES products(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS message_threads (
-            message_id TEXT PRIMARY KEY,
-            group_id TEXT NOT NULL,
-            root_image_message_id TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_message_threads_group_root
-        ON message_threads(group_id, root_image_message_id);
         """)
 
         # Upgrade older products table if needed.
@@ -197,7 +162,6 @@ def init_db():
             ("image_key", "ALTER TABLE products ADD COLUMN image_key TEXT"),
             ("image_blob", "ALTER TABLE products ADD COLUMN image_blob BLOB"),
             ("image_mime", "ALTER TABLE products ADD COLUMN image_mime TEXT"),
-            ("price", "ALTER TABLE products ADD COLUMN price INTEGER"),
         ]:
             if not column_exists(conn, "products", column):
                 conn.execute(ddl)
@@ -205,7 +169,6 @@ def init_db():
         for column, ddl in [
             ("image_blob", "ALTER TABLE pending_images ADD COLUMN image_blob BLOB"),
             ("image_mime", "ALTER TABLE pending_images ADD COLUMN image_mime TEXT"),
-            ("price", "ALTER TABLE pending_images ADD COLUMN price INTEGER"),
         ]:
             if not column_exists(conn, "pending_images", column):
                 conn.execute(ddl)
@@ -325,6 +288,234 @@ def staff_list_text():
         name = row["display_name"] or f"小幫手 #{short_code(row['user_id'])}"
         lines.append(f"{i}. {name}")
     return "\n".join(lines)
+
+
+
+def procurement_totals(product_id):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT spec_name, quantity
+            FROM procurement_items
+            WHERE product_id=?
+            """,
+            (product_id,),
+        ).fetchall()
+
+    return {
+        row["spec_name"]: int(row["quantity"])
+        for row in rows
+    }
+
+
+def procurement_summary(product_id):
+    _, _, spec_totals, _, ordered_total = order_summary(product_id)
+    purchased = procurement_totals(product_id)
+
+    waiting_by_spec = {}
+    purchased_total = 0
+
+    for spec_name, ordered_qty in spec_totals.items():
+        bought_qty = min(
+            int(purchased.get(spec_name, 0)),
+            int(ordered_qty),
+        )
+        purchased_total += bought_qty
+        waiting_by_spec[spec_name] = max(
+            int(ordered_qty) - bought_qty,
+            0,
+        )
+
+    waiting_total = sum(waiting_by_spec.values())
+
+    return (
+        spec_totals,
+        purchased,
+        waiting_by_spec,
+        ordered_total,
+        purchased_total,
+        waiting_total,
+    )
+
+
+def add_procurement(product_id, spec_name, qty):
+    qty = int(qty)
+
+    if qty <= 0:
+        return
+
+    _, _, waiting_by_spec, _, _, _ = procurement_summary(product_id)
+    remaining = int(waiting_by_spec.get(spec_name, 0))
+
+    if remaining <= 0:
+        return
+
+    add_qty = min(qty, remaining)
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO procurement_items(
+                product_id,
+                spec_name,
+                quantity,
+                updated_at
+            )
+            VALUES(?,?,?,?)
+            ON CONFLICT(product_id,spec_name)
+            DO UPDATE SET
+                quantity=quantity+excluded.quantity,
+                updated_at=excluded.updated_at
+            """,
+            (
+                product_id,
+                spec_name,
+                add_qty,
+                now_iso(),
+            ),
+        )
+
+
+def set_procurement_state(operator_user_id, product_id):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO procurement_states(
+                operator_user_id,
+                product_id,
+                created_at
+            )
+            VALUES(?,?,?)
+            ON CONFLICT(operator_user_id)
+            DO UPDATE SET
+                product_id=excluded.product_id,
+                created_at=excluded.created_at
+            """,
+            (
+                operator_user_id,
+                product_id,
+                now_iso(),
+            ),
+        )
+
+
+def get_procurement_state(operator_user_id):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM procurement_states
+            WHERE operator_user_id=?
+            """,
+            (operator_user_id,),
+        ).fetchone()
+
+
+def clear_procurement_state(operator_user_id):
+    with db() as conn:
+        conn.execute(
+            """
+            DELETE FROM procurement_states
+            WHERE operator_user_id=?
+            """,
+            (operator_user_id,),
+        )
+
+
+def procurement_prompt_text(product):
+    (
+        spec_totals,
+        purchased,
+        waiting,
+        ordered_total,
+        purchased_total,
+        waiting_total,
+    ) = procurement_summary(product["id"])
+
+    lines = [
+        f"📦 {product['product_code']} 採購入單",
+        f"已喊 {ordered_total}｜已拿 {purchased_total}｜待拿 {waiting_total}",
+        "",
+    ]
+
+    for spec_name, ordered_qty in spec_totals.items():
+        got = min(
+            int(purchased.get(spec_name, 0)),
+            int(ordered_qty),
+        )
+        left = int(waiting.get(spec_name, 0))
+        lines.append(
+            f"{spec_name}：喊{ordered_qty}｜拿{got}｜待{left}"
+        )
+
+    lines.extend([
+        "",
+        "輸入這次拿到的數量：",
+        "單一規格可打：+14",
+        "多規格可打：玲娜+5 包包+3",
+        "",
+        "輸入「取消入單」離開。",
+    ])
+
+    return "\n".join(lines)
+
+
+def outstanding_products_text():
+    session = get_active_session()
+
+    if not session:
+        return "目前沒有進行中的連線。"
+
+    with db() as conn:
+        products = conn.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE session_id=?
+            ORDER BY id ASC
+            """,
+            (session["id"],),
+        ).fetchall()
+
+    lines = [
+        f"📍 {session['session_code']}",
+        "🛒 待拿商品",
+    ]
+
+    found = False
+
+    for product in products:
+        (
+            _,
+            _,
+            waiting,
+            ordered_total,
+            purchased_total,
+            waiting_total,
+        ) = procurement_summary(product["id"])
+
+        if waiting_total <= 0:
+            continue
+
+        found = True
+        spec_text = "、".join(
+            f"{spec}×{qty}"
+            for spec, qty in waiting.items()
+            if qty > 0
+        )
+
+        lines.append(
+            f"{product['product_code']}｜"
+            f"喊{ordered_total}｜拿{purchased_total}｜待{waiting_total}"
+        )
+        if spec_text:
+            lines.append(f"　{spec_text}")
+
+    if not found:
+        lines.append("✅ 目前全部都拿齊了。")
+
+    return "\n".join(lines)
+
 
 
 # ---------- LINE API ----------
@@ -451,206 +642,6 @@ def get_group_profile(group_id, user_id):
         "displayName": user_id or "未知會員",
         "pictureUrl": None,
     }
-
-
-def get_group_summary(group_id):
-    if not CHANNEL_ACCESS_TOKEN or not group_id:
-        return None
-
-    try:
-        r = requests.get(
-            f"https://api.line.me/v2/bot/group/{group_id}/summary",
-            headers=auth_headers(),
-            timeout=10,
-        )
-        if r.ok:
-            return r.json()
-    except requests.RequestException:
-        pass
-
-    return None
-
-
-def _format_taipei_time(timestamp_ms):
-    try:
-        dt = datetime.fromtimestamp(
-            timestamp_ms / 1000,
-            tz=timezone.utc,
-        ).astimezone(TAIPEI_TZ)
-    except (TypeError, ValueError, OSError):
-        dt = datetime.now(TAIPEI_TZ)
-
-    return dt.strftime("%Y/%m/%d %H:%M:%S")
-
-
-def record_member_left_and_maybe_alert(event):
-    """
-    LINE memberLeft webhook:
-      event["source"]["groupId"]
-      event["left"]["members"]
-
-    Rule:
-      - Same group
-      - Rolling 30-second window
-      - 2 or more members leave => immediately push a private alert to Owner
-      - Never send anything to the customer group
-      - At most one alert per group every 30 seconds to avoid alert spam
-      - webhookEventId + userId prevents LINE webhook redelivery from double-counting
-    """
-    source = event.get("source") or {}
-    if source.get("type") != "group":
-        return
-
-    group_id = source.get("groupId")
-    if not group_id:
-        return
-
-    members = (event.get("left") or {}).get("members") or []
-    if not members:
-        return
-
-    occurred_at_ms = event.get("timestamp")
-    if not isinstance(occurred_at_ms, int):
-        occurred_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    webhook_event_id = event.get("webhookEventId") or (
-        f"{group_id}:{occurred_at_ms}"
-    )
-
-    # Save each leaving member. INSERT OR IGNORE prevents redelivery duplicates.
-    with db() as conn:
-        for i, member in enumerate(members):
-            member_user_id = (member or {}).get("userId")
-            # userId should normally exist. Fallback still keeps multiple members
-            # in the same webhook as separate leave records.
-            dedupe_user_id = member_user_id or f"unknown-{i}"
-
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO group_leave_events(
-                    group_id,
-                    user_id,
-                    webhook_event_id,
-                    occurred_at_ms,
-                    created_at
-                )
-                VALUES(?,?,?,?,?)
-                """,
-                (
-                    group_id,
-                    dedupe_user_id,
-                    webhook_event_id,
-                    occurred_at_ms,
-                    now_iso(),
-                ),
-            )
-
-        # Keep the table small; anything older than 10 minutes is irrelevant.
-        conn.execute(
-            """
-            DELETE FROM group_leave_events
-            WHERE occurred_at_ms < ?
-            """,
-            (
-                occurred_at_ms - (10 * 60 * 1000),
-            ),
-        )
-
-        window_start_ms = (
-            occurred_at_ms
-            - LEAVE_ALERT_WINDOW_SECONDS * 1000
-        )
-
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM group_leave_events
-            WHERE group_id=?
-              AND occurred_at_ms>=?
-              AND occurred_at_ms<=?
-            """,
-            (
-                group_id,
-                window_start_ms,
-                occurred_at_ms,
-            ),
-        ).fetchone()
-
-        leave_count = int(row["cnt"] if row else 0)
-
-        state = conn.execute(
-            """
-            SELECT last_alert_at_ms, last_alert_count
-            FROM leave_alert_state
-            WHERE group_id=?
-            """,
-            (group_id,),
-        ).fetchone()
-
-        last_alert_at_ms = (
-            int(state["last_alert_at_ms"])
-            if state
-            else 0
-        )
-
-        cooldown_ms = LEAVE_ALERT_COOLDOWN_SECONDS * 1000
-        should_alert = (
-            leave_count >= LEAVE_ALERT_THRESHOLD
-            and (
-                not last_alert_at_ms
-                or occurred_at_ms - last_alert_at_ms >= cooldown_ms
-            )
-        )
-
-        if should_alert:
-            conn.execute(
-                """
-                INSERT INTO leave_alert_state(
-                    group_id,
-                    last_alert_at_ms,
-                    last_alert_count
-                )
-                VALUES(?,?,?)
-                ON CONFLICT(group_id) DO UPDATE SET
-                    last_alert_at_ms=excluded.last_alert_at_ms,
-                    last_alert_count=excluded.last_alert_count
-                """,
-                (
-                    group_id,
-                    occurred_at_ms,
-                    leave_count,
-                ),
-            )
-
-    if not should_alert:
-        return
-
-    owner_id = get_owner_user_id()
-    if not owner_id:
-        return
-
-    summary = get_group_summary(group_id) or {}
-    group_name = summary.get("groupName") or "LINE 群組"
-    alert_time = _format_taipei_time(occurred_at_ms)
-
-    alert_text = (
-        "🚨【防翻群異常警報】\n"
-        f"群組：{group_name}\n"
-        f"⚠️ 30 秒內已有 {leave_count} 位成員離開／被移除\n"
-        f"時間：{alert_time}\n\n"
-        "請立即查看群組狀況。"
-    )
-
-    # Private push to Owner only. Nothing is sent to the group.
-    push_messages(
-        owner_id,
-        [
-            {
-                "type": "text",
-                "text": alert_text,
-            }
-        ],
-    )
 
 
 def fetch_line_image(message_id):
@@ -925,68 +916,6 @@ def allocate_product_code(session, group_id):
     )
 
 
-# ---------- Reply-thread / price helpers ----------
-
-PRICE_RE = re.compile(r"^\s*(?:NT\$|TWD\s*|\$|＄)?\s*(\d{1,7})\s*(?:元|塊)?\s*$", re.IGNORECASE)
-
-def parse_price_text(text):
-    match = PRICE_RE.fullmatch((text or "").strip())
-    if not match:
-        return None
-    value = int(match.group(1))
-    return value if 0 < value <= 9999999 else None
-
-def remember_thread_message(message_id, group_id, root_image_message_id):
-    if not message_id or not group_id or not root_image_message_id:
-        return
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO message_threads(message_id, group_id, root_image_message_id, created_at)
-            VALUES(?,?,?,?)
-            ON CONFLICT(message_id) DO UPDATE SET
-                group_id=excluded.group_id,
-                root_image_message_id=excluded.root_image_message_id
-            """,
-            (message_id, group_id, root_image_message_id, now_iso()),
-        )
-
-def resolve_root_image(group_id, quoted_message_id):
-    if not group_id or not quoted_message_id:
-        return None
-
-    # Direct reply to an original product photo.
-    if get_pending_image(group_id, quoted_message_id):
-        return quoted_message_id
-
-    product = get_product_by_image(quoted_message_id)
-    if product and product["group_id"] == group_id:
-        return quoted_message_id
-
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT root_image_message_id
-            FROM message_threads
-            WHERE message_id=? AND group_id=?
-            """,
-            (quoted_message_id, group_id),
-        ).fetchone()
-    return row["root_image_message_id"] if row else None
-
-def set_product_price_by_root(group_id, root_image_message_id, price):
-    if not group_id or not root_image_message_id or price is None:
-        return
-    with db() as conn:
-        conn.execute(
-            "UPDATE pending_images SET price=? WHERE message_id=? AND group_id=?",
-            (price, root_image_message_id, group_id),
-        )
-        conn.execute(
-            "UPDATE products SET price=? WHERE image_message_id=? AND group_id=?",
-            (price, root_image_message_id, group_id),
-        )
-
 # ---------- Images / products ----------
 
 def remember_image(message_id, group_id, sender_user_id):
@@ -1080,10 +1009,9 @@ def create_product_from_pending(image):
                 image_key,
                 image_blob,
                 image_mime,
-                price,
                 created_at
             )
-            VALUES(?,?,?,?,?,?,0,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,0,?,?,?,?)
             """,
             (
                 product_code,
@@ -1095,7 +1023,6 @@ def create_product_from_pending(image):
                 secrets.token_urlsafe(16),
                 image["image_blob"],
                 image["image_mime"],
-                image["price"] if "price" in image.keys() else None,
                 now_iso(),
             ),
         )
@@ -1357,130 +1284,6 @@ def order_summary(product_id):
     )
 
 
-# ---------- Procurement tracking ----------
-
-def get_spec_required_qty(product_id, spec_name):
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT COALESCE(SUM(quantity), 0) AS qty
-            FROM order_items
-            WHERE product_id=? AND spec_name=? AND quantity>0
-            """,
-            (product_id, spec_name),
-        ).fetchone()
-    return int(row["qty"] if row else 0)
-
-
-def get_purchased_qty(product_id, spec_name):
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT purchased_qty
-            FROM procurement_items
-            WHERE product_id=? AND spec_name=?
-            """,
-            (product_id, spec_name),
-        ).fetchone()
-    return int(row["purchased_qty"] if row else 0)
-
-
-def set_purchased_qty(product_id, spec_name, qty):
-    required = get_spec_required_qty(product_id, spec_name)
-    qty = max(0, min(int(qty), required))
-
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO procurement_items(
-                product_id, spec_name, purchased_qty, updated_at
-            )
-            VALUES(?,?,?,?)
-            ON CONFLICT(product_id, spec_name)
-            DO UPDATE SET
-                purchased_qty=excluded.purchased_qty,
-                updated_at=excluded.updated_at
-            """,
-            (product_id, spec_name, qty, now_iso()),
-        )
-    return qty, required
-
-
-def change_purchased_qty(product_id, spec_name, delta):
-    current = get_purchased_qty(product_id, spec_name)
-    return set_purchased_qty(
-        product_id,
-        spec_name,
-        current + int(delta),
-    )
-
-
-def procurement_summary(product_id, spec_totals):
-    result = {}
-    purchased_total = 0
-    waiting_total = 0
-
-    for spec_name, required in spec_totals.items():
-        purchased = min(
-            get_purchased_qty(product_id, spec_name),
-            required,
-        )
-        waiting = max(required - purchased, 0)
-        result[spec_name] = {
-            "required": required,
-            "purchased": purchased,
-            "waiting": waiting,
-        }
-        purchased_total += purchased
-        waiting_total += waiting
-
-    return result, purchased_total, waiting_total
-
-
-def procurement_buttons(product, spec_name):
-    encoded_spec = quote_plus(spec_name)
-    base = f"product_id={product['id']}&spec={encoded_spec}"
-
-    return {
-        "type": "box",
-        "layout": "horizontal",
-        "spacing": "sm",
-        "margin": "sm",
-        "contents": [
-            {
-                "type": "button",
-                "style": "secondary",
-                "height": "sm",
-                "action": {
-                    "type": "postback",
-                    "label": "－1",
-                    "data": f"action=procure_minus&{base}",
-                },
-            },
-            {
-                "type": "button",
-                "style": "primary",
-                "height": "sm",
-                "action": {
-                    "type": "postback",
-                    "label": "入單 +1",
-                    "data": f"action=procure_plus&{base}",
-                },
-            },
-            {
-                "type": "button",
-                "style": "secondary",
-                "height": "sm",
-                "action": {
-                    "type": "postback",
-                    "label": "全數入單",
-                    "data": f"action=procure_all&{base}",
-                },
-            },
-        ],
-    }
-
-
 # ---------- Flex cards ----------
 
 def short_code(user_id):
@@ -1504,6 +1307,21 @@ def product_action_buttons(product, viewer_user_id):
         }
     ]
 
+    # Owner / 小幫手都可做採購入單
+    if can_query(viewer_user_id):
+        buttons.append({
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "postback",
+                "label": "入單",
+                "data": f"action=procure&product_id={product['id']}",
+                "displayText": f"{product['product_code']} 入單",
+            },
+        })
+
+    # 結單只留給 Owner
     if is_owner(viewer_user_id):
         buttons.append({
             "type": "button",
@@ -1528,11 +1346,6 @@ def build_product_card(product, viewer_user_id, title=None):
         people_count,
         total_qty,
     ) = order_summary(product["id"])
-
-    procurement, purchased_total, waiting_total = procurement_summary(
-        product["id"],
-        spec_totals,
-    )
 
     name_counts = Counter(
         (
@@ -1561,16 +1374,6 @@ def build_product_card(product, viewer_user_id, title=None):
             "color": "#666666",
             "margin": "sm",
         },
-        *([
-            {
-                "type": "text",
-                "text": f"💰 價格 NT$ {product['price']}",
-                "size": "sm",
-                "weight": "bold",
-                "margin": "sm",
-                "wrap": True,
-            }
-        ] if product["price"] is not None else []),
         {
             "type": "separator",
             "margin": "lg",
@@ -1675,45 +1478,28 @@ def build_product_card(product, viewer_user_id, title=None):
             spec_totals.items(),
             key=lambda x: x[0],
         ):
-            status = procurement.get(
-                spec_name,
-                {"required": qty, "purchased": 0, "waiting": qty},
-            )
-
             body.append({
                 "type": "box",
-                "layout": "vertical",
-                "margin": "md",
+                "layout": "horizontal",
+                "margin": "sm",
                 "contents": [
                     {
                         "type": "text",
                         "text": spec_name,
                         "size": "sm",
-                        "weight": "bold",
+                        "flex": 1,
                         "wrap": True,
                     },
                     {
                         "type": "text",
-                        "text": (
-                            f"需求 {status['required']} ｜ "
-                            f"✅ 已購 {status['purchased']} ｜ "
-                            f"🛒 待購 {status['waiting']}"
-                        ),
-                        "size": "xs",
-                        "color": "#555555",
-                        "margin": "xs",
-                        "wrap": True,
+                        "text": f"× {qty}",
+                        "size": "sm",
+                        "weight": "bold",
+                        "align": "end",
+                        "flex": 0,
                     },
                 ],
             })
-
-            if can_query(viewer_user_id):
-                body.append(
-                    procurement_buttons(
-                        product,
-                        spec_name,
-                    )
-                )
     else:
         body.append({
             "type": "text",
@@ -1723,39 +1509,48 @@ def build_product_card(product, viewer_user_id, title=None):
             "margin": "sm",
         })
 
+    (
+        _,
+        _,
+        waiting_by_spec,
+        ordered_total,
+        purchased_total,
+        waiting_total,
+    ) = procurement_summary(product["id"])
+
     body.extend([
         {
             "type": "separator",
             "margin": "lg",
         },
         {
-            "type": "text",
-            "text": f"👥 {people_count} 人 ｜ 📦 訂購總數 {total_qty}",
-            "size": "sm",
-            "margin": "lg",
-            "wrap": True,
-        },
-        {
             "type": "box",
             "layout": "horizontal",
-            "margin": "sm",
+            "margin": "lg",
             "contents": [
                 {
                     "type": "text",
-                    "text": f"✅ 已購 {purchased_total}",
+                    "text": f"👥 {people_count} 人",
                     "size": "sm",
-                    "weight": "bold",
                     "flex": 1,
                 },
                 {
                     "type": "text",
-                    "text": f"🛒 待購 {waiting_total}",
+                    "text": f"📦 總數 {total_qty}",
                     "size": "sm",
                     "weight": "bold",
                     "align": "end",
                     "flex": 1,
                 },
             ],
+        },
+        {
+            "type": "text",
+            "text": f"🛒 已喊 {ordered_total}｜已拿 {purchased_total}｜待拿 {waiting_total}",
+            "size": "sm",
+            "weight": "bold",
+            "margin": "md",
+            "wrap": True,
         },
     ])
 
@@ -1813,6 +1608,154 @@ def notify_owner_product_created(product):
     )
 
 
+
+def find_session_by_date(month, day):
+    """Owner / 小幫手私訊 8/16，找到該日期連線場次。"""
+    prefix = f"{int(month):02d}{int(day):02d}"
+
+    with db() as conn:
+        active = conn.execute(
+            """
+            SELECT *
+            FROM sessions
+            WHERE is_active=1
+              AND session_code LIKE ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (prefix + "%",),
+        ).fetchone()
+
+        if active:
+            return active
+
+        return conn.execute(
+            """
+            SELECT *
+            FROM sessions
+            WHERE session_code LIKE ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (prefix + "%",),
+        ).fetchone()
+
+
+def build_session_products_carousel(session, viewer_user_id):
+    """顯示該場次最近 10 個商品；小幫手只有查單按鈕。"""
+    with db() as conn:
+        products = conn.execute(
+            """
+            SELECT *
+            FROM products
+            WHERE session_id=?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (session["id"],),
+        ).fetchall()
+
+    if not products:
+        return {
+            "type": "text",
+            "text": f"📍 {session['session_code']}\n目前還沒有成立的商品。",
+        }
+
+    bubbles = []
+
+    for product in reversed(products):
+        _, _, spec_totals, people_count, total_qty = order_summary(product["id"])
+        (
+            _,
+            _,
+            waiting_by_spec,
+            ordered_total,
+            purchased_total,
+            waiting_total,
+        ) = procurement_summary(product["id"])
+
+        body = [
+            {
+                "type": "text",
+                "text": product["product_code"],
+                "weight": "bold",
+                "size": "md",
+                "wrap": True,
+            },
+            {
+                "type": "text",
+                "text": "🔒 已結單" if product["is_closed"] else "🟢 開放喊單",
+                "size": "xs",
+                "color": "#666666",
+                "margin": "sm",
+            },
+            {
+                "type": "text",
+                "text": f"👥 {people_count} 人　📦 {total_qty} 件",
+                "size": "sm",
+                "margin": "md",
+            },
+            {
+                "type": "text",
+                "text": f"🛒 拿 {purchased_total}｜待 {waiting_total}",
+                "size": "xs",
+                "weight": "bold",
+                "margin": "sm",
+            },
+        ]
+
+        if spec_totals:
+            summary_text = "｜".join(
+                f"{spec}×{qty}"
+                for spec, qty in list(spec_totals.items())[:4]
+            )
+            body.append({
+                "type": "text",
+                "text": summary_text,
+                "size": "xs",
+                "color": "#555555",
+                "wrap": True,
+                "margin": "sm",
+            })
+
+        bubble = {
+            "type": "bubble",
+            "size": "micro",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": body,
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": product_action_buttons(product, viewer_user_id),
+            },
+        }
+
+        image_url = product_image_url(product)
+        if image_url:
+            bubble["hero"] = {
+                "type": "image",
+                "url": image_url,
+                "size": "full",
+                "aspectRatio": "1:1",
+                "aspectMode": "cover",
+            }
+
+        bubbles.append(bubble)
+
+    return {
+        "type": "flex",
+        "altText": f"{session['session_code']} 商品列表",
+        "contents": {
+            "type": "carousel",
+            "contents": bubbles,
+        },
+    }
+
+
 def product_list_text():
     session = get_active_session()
 
@@ -1861,302 +1804,6 @@ def product_list_text():
     return "\n".join(lines)
 
 
-def procurement_list_text(mode="waiting"):
-    """Build a session-wide procurement report for Owner/staff private chat."""
-    session = get_active_session()
-
-    # If the session was just ended, still allow checking the most recent session.
-    if not session:
-        with db() as conn:
-            session = conn.execute(
-                """
-                SELECT * FROM sessions
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            ).fetchone()
-
-    if not session:
-        return "目前還沒有任何連線紀錄。"
-
-    with db() as conn:
-        products = conn.execute(
-            """
-            SELECT *
-            FROM products
-            WHERE session_id=?
-            ORDER BY id ASC
-            """,
-            (session["id"],),
-        ).fetchall()
-
-    if not products:
-        return (
-            f"📍 {session['session_code']}\n"
-            "目前還沒有成立的商品。"
-        )
-
-    if mode == "waiting":
-        title = "🛒 待採購清單"
-    elif mode == "purchased":
-        title = "✅ 已採購清單"
-    else:
-        title = "📊 採購總覽"
-
-    lines = [title, f"📍 {session['session_code']}", ""]
-    grand_required = 0
-    grand_purchased = 0
-    grand_waiting = 0
-    shown_rows = 0
-
-    for product in products:
-        _, _, spec_totals, _, _ = order_summary(product["id"])
-        if not spec_totals:
-            continue
-
-        procurement, purchased_total, waiting_total = procurement_summary(
-            product["id"],
-            spec_totals,
-        )
-
-        grand_required += sum(spec_totals.values())
-        grand_purchased += purchased_total
-        grand_waiting += waiting_total
-
-        product_lines = []
-        for spec_name, status in sorted(procurement.items(), key=lambda x: x[0]):
-            if mode == "waiting" and status["waiting"] <= 0:
-                continue
-            if mode == "purchased" and status["purchased"] <= 0:
-                continue
-
-            if mode == "waiting":
-                detail = (
-                    f"・{spec_name}：待購 {status['waiting']}"
-                    f"（需求 {status['required']}／已購 {status['purchased']}）"
-                )
-            elif mode == "purchased":
-                detail = (
-                    f"・{spec_name}：已購 {status['purchased']}"
-                    f"（需求 {status['required']}／待購 {status['waiting']}）"
-                )
-            else:
-                detail = (
-                    f"・{spec_name}：需求 {status['required']}｜"
-                    f"已購 {status['purchased']}｜待購 {status['waiting']}"
-                )
-
-            product_lines.append(detail)
-            shown_rows += 1
-
-        if product_lines:
-            price_label = f"｜NT$ {product['price']}" if product["price"] is not None else ""
-            lines.append(f"【{product['product_code']}{price_label}】")
-            lines.extend(product_lines)
-            lines.append("")
-
-    if shown_rows == 0:
-        if mode == "waiting":
-            return (
-                f"🎉 {session['session_code']}\n"
-                "目前全部都已經採購完成，沒有待採購商品。"
-            )
-        if mode == "purchased":
-            return (
-                f"📍 {session['session_code']}\n"
-                "目前還沒有標記任何已採購商品。"
-            )
-        return (
-            f"📍 {session['session_code']}\n"
-            "目前沒有可顯示的採購資料。"
-        )
-
-    lines.extend([
-        "──────────",
-        f"📦 需求總數：{grand_required}",
-        f"✅ 已購總數：{grand_purchased}",
-        f"🛒 待購總數：{grand_waiting}",
-    ])
-
-    # LINE text messages have a 5,000-character limit.
-    text = "\n".join(lines)
-    if len(text) > 4900:
-        text = text[:4850] + "\n…清單過長，請用商品編號查單查看其餘內容。"
-    return text
-
-
-def build_end_session_product_bubble(product):
-    """Compact procurement bubble used in the end-of-session image summary."""
-    _, _, spec_totals, _, _ = order_summary(product["id"])
-    procurement, purchased_total, waiting_total = procurement_summary(
-        product["id"],
-        spec_totals,
-    )
-    required_total = sum(spec_totals.values())
-
-    body = [
-        {
-            "type": "text",
-            "text": product["product_code"],
-            "weight": "bold",
-            "size": "lg",
-            "wrap": True,
-        },
-        *([
-            {
-                "type": "text",
-                "text": f"💰 NT$ {product['price']}",
-                "size": "sm",
-                "weight": "bold",
-                "margin": "xs",
-                "wrap": True,
-            }
-        ] if product["price"] is not None else []),
-        {
-            "type": "text",
-            "text": (
-                f"📦 需求 {required_total}  ｜  "
-                f"✅ 已購 {purchased_total}  ｜  "
-                f"🛒 待購 {waiting_total}"
-            ),
-            "size": "xs",
-            "color": "#666666",
-            "margin": "sm",
-            "wrap": True,
-        },
-        {
-            "type": "separator",
-            "margin": "md",
-        },
-    ]
-
-    if procurement:
-        for spec_name, status in sorted(procurement.items(), key=lambda x: x[0]):
-            body.extend([
-                {
-                    "type": "text",
-                    "text": f"・{spec_name}",
-                    "size": "sm",
-                    "weight": "bold",
-                    "margin": "md",
-                    "wrap": True,
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        f"喊單 +{status['required']}  ｜  "
-                        f"採購 {status['purchased']}  ｜  "
-                        f"待購 {status['waiting']}"
-                    ),
-                    "size": "xs",
-                    "color": "#555555",
-                    "margin": "xs",
-                    "wrap": True,
-                },
-            ])
-    else:
-        body.append({
-            "type": "text",
-            "text": "目前沒有喊單資料",
-            "size": "sm",
-            "color": "#777777",
-            "margin": "md",
-        })
-
-    bubble = {
-        "type": "bubble",
-        "size": "kilo",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": body,
-        },
-    }
-
-    image_url = product_image_url(product)
-    if image_url:
-        bubble["hero"] = {
-            "type": "image",
-            "url": image_url,
-            "size": "full",
-            "aspectRatio": "1:1",
-            "aspectMode": "cover",
-        }
-
-    return bubble
-
-
-def build_end_session_messages(session):
-    """Return up to five LINE messages: image carousels plus a session total."""
-    with db() as conn:
-        products = conn.execute(
-            """
-            SELECT *
-            FROM products
-            WHERE session_id=?
-            ORDER BY id ASC
-            """,
-            (session["id"],),
-        ).fetchall()
-
-    grand_required = 0
-    grand_purchased = 0
-    grand_waiting = 0
-    eligible = []
-
-    for product in products:
-        _, _, spec_totals, _, _ = order_summary(product["id"])
-        if not spec_totals:
-            continue
-        _, purchased_total, waiting_total = procurement_summary(
-            product["id"],
-            spec_totals,
-        )
-        grand_required += sum(spec_totals.values())
-        grand_purchased += purchased_total
-        grand_waiting += waiting_total
-        eligible.append(product)
-
-    summary_text = (
-        f"✅ 已結束 {session['session_code']}\n\n"
-        "📋 結束連線總計\n"
-        f"📦 喊單總數：{grand_required}\n"
-        f"✅ 已採購：{grand_purchased}\n"
-        f"🛒 待採購：{grand_waiting}"
-    )
-
-    if not eligible:
-        return [{"type": "text", "text": summary_text + "\n\n目前沒有成立的商品。"}]
-
-    # LINE reply API allows at most 5 messages. Reserve one for the text total,
-    # so up to four carousels are emitted. Each carousel contains at most 10 products.
-    visible = eligible[:40]
-    messages = []
-    for start in range(0, len(visible), 10):
-        chunk = visible[start:start + 10]
-        messages.append({
-            "type": "flex",
-            "altText": f"{session['session_code']} 結束連線商品總表",
-            "contents": {
-                "type": "carousel",
-                "contents": [
-                    build_end_session_product_bubble(product)
-                    for product in chunk
-                ],
-            },
-        })
-
-    if len(eligible) > len(visible):
-        summary_text += (
-            f"\n\n⚠️ 本場共有 {len(eligible)} 個商品，"
-            f"圖片總表先顯示前 {len(visible)} 個；"
-            "其餘可輸入「採購總覽」查看。"
-        )
-
-    messages.append({"type": "text", "text": summary_text[:5000]})
-    return messages[:5]
-
-
 # ---------- Routes ----------
 
 @app.get("/")
@@ -2164,7 +1811,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "15-thread-price-tracking",
+        "version": "15-procurement-tracking",
     })
 
 
@@ -2213,13 +1860,6 @@ def webhook():
     for event in body.get("events", []):
         event_type = event.get("type")
 
-        # ---------- ANTI-RAID: MASS MEMBER LEAVE ----------
-        # LINE memberLeft webhook can contain one or multiple members.
-        # If 2+ members leave within 30 seconds, alert Owner privately only.
-        if event_type == "memberLeft":
-            record_member_left_and_maybe_alert(event)
-            continue
-
         # 客人收回 LINE 訊息時，LINE 會送 unsend 事件。
         # 這裡刻意忽略：已成立的喊單不會因收回訊息而刪除。
         if event_type == "unsend":
@@ -2258,72 +1898,6 @@ def webhook():
                 reply_text(reply_token, "找不到這個商品。")
                 continue
 
-            if action in (
-                "procure_plus",
-                "procure_minus",
-                "procure_all",
-            ):
-                if not can_query(user_id):
-                    continue
-
-                spec_name = unquote_plus(
-                    params.get("spec", "")
-                ).strip()
-
-                if not spec_name:
-                    reply_text(
-                        reply_token,
-                        "找不到這個規格。",
-                    )
-                    continue
-
-                required = get_spec_required_qty(
-                    product["id"],
-                    spec_name,
-                )
-
-                if required <= 0:
-                    reply_text(
-                        reply_token,
-                        "這個規格目前沒有待採購數量。",
-                    )
-                    continue
-
-                if action == "procure_plus":
-                    change_purchased_qty(
-                        product["id"],
-                        spec_name,
-                        1,
-                    )
-                elif action == "procure_minus":
-                    change_purchased_qty(
-                        product["id"],
-                        spec_name,
-                        -1,
-                    )
-                else:
-                    set_purchased_qty(
-                        product["id"],
-                        spec_name,
-                        required,
-                    )
-
-                product = get_product_by_code(
-                    product["product_code"]
-                )
-
-                reply_messages(
-                    reply_token,
-                    [
-                        build_product_card(
-                            product,
-                            user_id,
-                            title=f"🛒 {product['product_code']} 採購進度",
-                        )
-                    ],
-                )
-                continue
-
             if action == "query":
                 if not can_query(user_id):
                     continue
@@ -2337,6 +1911,21 @@ def webhook():
                             title=f"📋 {product['product_code']} 查單",
                         )
                     ],
+                )
+                continue
+
+            if action == "procure":
+                if not can_query(user_id):
+                    continue
+
+                set_procurement_state(
+                    user_id,
+                    product["id"],
+                )
+
+                reply_text(
+                    reply_token,
+                    procurement_prompt_text(product),
                 )
                 continue
 
@@ -2381,6 +1970,119 @@ def webhook():
 
             text = message.get("text", "").strip()
 
+            # Owner / 小幫手採購入單模式
+            procurement_state = get_procurement_state(user_id)
+
+            if procurement_state:
+                if text == "取消入單":
+                    clear_procurement_state(user_id)
+                    reply_text(
+                        reply_token,
+                        "✅ 已離開採購入單模式。",
+                    )
+                    continue
+
+                with db() as conn:
+                    product = conn.execute(
+                        "SELECT * FROM products WHERE id=?",
+                        (procurement_state["product_id"],),
+                    ).fetchone()
+
+                if not product:
+                    clear_procurement_state(user_id)
+                    reply_text(
+                        reply_token,
+                        "找不到商品，已離開入單模式。",
+                    )
+                    continue
+
+                parsed = parse_order_text(text)
+
+                if not parsed or parsed[0] != "ADD":
+                    reply_text(
+                        reply_token,
+                        procurement_prompt_text(product),
+                    )
+                    continue
+
+                items = parsed[1]
+
+                # 如果商品只有一個實際規格，純 +N 就自動對應該規格。
+                (
+                    spec_totals,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = procurement_summary(product["id"])
+
+                real_specs = list(spec_totals.keys())
+
+                normalized_items = []
+
+                for spec_name, qty in items:
+                    if (
+                        spec_name == "單一規格"
+                        and len(real_specs) == 1
+                    ):
+                        normalized_items.append(
+                            (real_specs[0], qty)
+                        )
+                    else:
+                        normalized_items.append(
+                            (spec_name, qty)
+                        )
+
+                for spec_name, qty in normalized_items:
+                    if spec_name not in spec_totals:
+                        continue
+
+                    add_procurement(
+                        product["id"],
+                        spec_name,
+                        qty,
+                    )
+
+                product = get_product_by_code(
+                    product["product_code"]
+                )
+
+                (
+                    _,
+                    _,
+                    _,
+                    ordered_total,
+                    purchased_total,
+                    waiting_total,
+                ) = procurement_summary(product["id"])
+
+                reply_messages(
+                    reply_token,
+                    [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"✅ 採購入單完成\n"
+                                f"已喊 {ordered_total}｜"
+                                f"已拿 {purchased_total}｜"
+                                f"待拿 {waiting_total}"
+                            ),
+                        },
+                        build_product_card(
+                            product,
+                            user_id,
+                            title=f"📦 {product['product_code']} 採購進度",
+                        ),
+                    ],
+                )
+
+                # 待拿歸零就自動離開這個商品的入單模式
+                if waiting_total <= 0:
+                    clear_procurement_state(user_id)
+
+                continue
+
             if text in ("設定Owner", "設定管理員"):
                 current = get_owner_user_id()
 
@@ -2409,7 +2111,7 @@ def webhook():
                     reply_text(
                         reply_token,
                         "✅ 已加入成為小幫手。\n"
-                        "小幫手可以查單與更新採購進度。",
+                        "小幫手僅有查單權限。",
                     )
                 else:
                     reply_text(
@@ -2440,6 +2142,39 @@ def webhook():
                     reply_token,
                     staff_list_text(),
                 )
+                continue
+
+            # Owner / 小幫手輸入 8/16，可直接查看該日期場次商品。
+            date_lookup = SESSION_DATE_LOOKUP_RE.match(text)
+            if date_lookup and can_query(user_id):
+                session = find_session_by_date(
+                    date_lookup.group(1),
+                    date_lookup.group(2),
+                )
+
+                if not session:
+                    reply_text(
+                        reply_token,
+                        f"找不到 {int(date_lookup.group(1))}/{int(date_lookup.group(2))} 的連線場次。",
+                    )
+                else:
+                    reply_messages(
+                        reply_token,
+                        [
+                            build_session_products_carousel(
+                                session,
+                                user_id,
+                            )
+                        ],
+                    )
+                continue
+
+            if text in ("待拿", "未採購", "還沒買"):
+                if can_query(user_id):
+                    reply_text(
+                        reply_token,
+                        outstanding_products_text(),
+                    )
                 continue
 
             start_match = START_SESSION_RE.match(text)
@@ -2483,18 +2218,9 @@ def webhook():
                         "目前沒有進行中的連線。",
                     )
                 else:
-                    overview = procurement_list_text("overview")
-                    if overview.startswith("📊 採購總覽"):
-                        overview = overview.replace(
-                            "📊 採購總覽",
-                            "📋 結束連線總表",
-                            1,
-                        )
-
-                    # 結束連線時回傳「商品照片卡 + 規格採購進度 + 整場總計」。
-                    reply_messages(
+                    reply_text(
                         reply_token,
-                        build_end_session_messages(session),
+                        f"✅ 已結束 {session['session_code']}",
                     )
                 continue
 
@@ -2505,33 +2231,6 @@ def webhook():
                 reply_text(
                     reply_token,
                     product_list_text(),
-                )
-                continue
-
-            if PROCUREMENT_WAITING_RE.match(text):
-                if not can_query(user_id):
-                    continue
-                reply_text(
-                    reply_token,
-                    procurement_list_text("waiting"),
-                )
-                continue
-
-            if PROCUREMENT_PURCHASED_RE.match(text):
-                if not can_query(user_id):
-                    continue
-                reply_text(
-                    reply_token,
-                    procurement_list_text("purchased"),
-                )
-                continue
-
-            if PROCUREMENT_OVERVIEW_RE.match(text):
-                if not can_query(user_id):
-                    continue
-                reply_text(
-                    reply_token,
-                    procurement_list_text("overview"),
                 )
                 continue
 
@@ -2603,21 +2302,13 @@ def webhook():
                     "或：開始連線 8/18-19 香港\n"
                     "結束連線\n"
                     "商品列表\n"
-                    "待採購清單\n"
-                    "已採購清單\n"
-                    "採購總覽\n"
                     "產生小幫手邀請碼\n"
                     "小幫手列表",
                 )
             elif is_staff(user_id):
                 reply_text(
                     reply_token,
-                    "小幫手可使用：\n"
-                    "商品列表\n"
-                    "待採購清單\n"
-                    "已採購清單\n"
-                    "採購總覽\n"
-                    "或點商品卡的「查單／採購按鈕」。",
+                    "小幫手可使用：\n8/16 → 查看該日期連線商品\n商品列表\n待拿\n商品卡「查單」\n商品卡「入單」",
                 )
 
             continue
@@ -2655,50 +2346,20 @@ def webhook():
         if not quoted_message_id:
             continue
 
-        # Follow the whole LINE reply chain back to the original product photo.
-        # Example: photo -> 問價格 -> 199 -> +1.
-        root_image_message_id = resolve_root_image(
-            group_id,
-            quoted_message_id,
+        parsed = parse_order_text(
+            message.get("text", "")
         )
 
-        if not root_image_message_id:
-            continue
-
-        current_message_id = message.get("id")
-        if current_message_id:
-            remember_thread_message(
-                current_message_id,
-                group_id,
-                root_image_message_id,
-            )
-
-        text_value = message.get("text", "")
-
-        # Owner / staff can simply reply 199, $199, 199元, etc.
-        # The price is saved to the product thread and the group stays silent.
-        price_value = parse_price_text(text_value)
-        if price_value is not None and can_query(user_id):
-            set_product_price_by_root(
-                group_id,
-                root_image_message_id,
-                price_value,
-            )
-            continue
-
-        parsed = parse_order_text(text_value)
-
         if not parsed:
-            # Non-order replies are still remembered above so deeper replies can be traced.
             continue
 
         pending = get_pending_image(
             group_id,
-            root_image_message_id,
+            quoted_message_id,
         )
 
         product = get_product_by_image(
-            root_image_message_id
+            quoted_message_id
         )
 
         created_now = False
@@ -2753,7 +2414,7 @@ def webhook():
             # 建立商品後再通知 Owner，第一筆規格會直接顯示在卡片裡。
             if created_now:
                 product = get_product_by_image(
-                    root_image_message_id
+                    quoted_message_id
                 )
                 notify_owner_product_created(
                     product
