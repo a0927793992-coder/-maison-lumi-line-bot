@@ -52,6 +52,212 @@ SESSION_LOOKUP_RE = re.compile(
 )
 
 
+PRICE_ONLY_RE = re.compile(
+    r"^\s*(?:NT\$|NTD|\$)?\s*(\d{2,6})\s*(?:元)?\s*$",
+    re.IGNORECASE,
+)
+PRICE_WITH_LABEL_RE = re.compile(
+    r"^\s*(.+?)\s*(?:NT\$|NTD|\$)?\s*(\d{2,6})\s*(?:元)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_price_text(text):
+    """
+    Boss / 小幫手回覆商品照片可用：
+      199
+      199元
+      $199
+      玲娜199
+      玲娜199元
+
+    有前綴文字時，前綴會當作規格標籤。
+    """
+    text = (text or "").strip()
+
+    if not text:
+        return None
+
+    m = PRICE_ONLY_RE.fullmatch(text)
+    if m:
+        price = int(m.group(1))
+        return {
+            "price": price,
+            "label": "",
+        }
+
+    m = PRICE_WITH_LABEL_RE.fullmatch(text)
+    if not m:
+        return None
+
+    label = m.group(1).strip()
+    price = int(m.group(2))
+
+    if not label or price <= 0:
+        return None
+
+    # 避免把 +1、日期等普通訊息誤判成價格標籤。
+    if "+" in label or "/" in label:
+        return None
+
+    return {
+        "price": price,
+        "label": label,
+    }
+
+
+def remember_price_message(
+    message_id,
+    group_id,
+    image_message_id,
+    price,
+    label,
+    sender_user_id,
+):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO price_messages(
+                message_id,
+                group_id,
+                image_message_id,
+                price,
+                label,
+                sender_user_id,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(message_id)
+            DO UPDATE SET
+                image_message_id=excluded.image_message_id,
+                price=excluded.price,
+                label=excluded.label,
+                sender_user_id=excluded.sender_user_id,
+                created_at=excluded.created_at
+            """,
+            (
+                message_id,
+                group_id,
+                image_message_id,
+                int(price),
+                label or "",
+                sender_user_id,
+                now_iso(),
+            ),
+        )
+
+
+def get_price_message(message_id):
+    if not message_id:
+        return None
+
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM price_messages
+            WHERE message_id=?
+            """,
+            (message_id,),
+        ).fetchone()
+
+
+def add_order_price_line(
+    product_id,
+    user_id,
+    display_name,
+    spec_name,
+    unit_price,
+    qty,
+):
+    if unit_price is None:
+        return
+
+    with db() as conn:
+        current = conn.execute(
+            """
+            SELECT quantity
+            FROM order_price_lines
+            WHERE product_id=?
+              AND user_id=?
+              AND spec_name=?
+              AND unit_price=?
+            """,
+            (
+                product_id,
+                user_id,
+                spec_name,
+                int(unit_price),
+            ),
+        ).fetchone()
+
+        new_qty = (
+            int(current["quantity"])
+            if current
+            else 0
+        ) + int(qty)
+
+        conn.execute(
+            """
+            INSERT INTO order_price_lines(
+                product_id,
+                user_id,
+                display_name,
+                spec_name,
+                unit_price,
+                quantity,
+                updated_at
+            )
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(product_id,user_id,spec_name,unit_price)
+            DO UPDATE SET
+                display_name=excluded.display_name,
+                quantity=excluded.quantity,
+                updated_at=excluded.updated_at
+            """,
+            (
+                product_id,
+                user_id,
+                display_name,
+                spec_name,
+                int(unit_price),
+                new_qty,
+                now_iso(),
+            ),
+        )
+
+
+def get_order_price_lines(product_id):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM order_price_lines
+            WHERE product_id=? AND quantity>0
+            ORDER BY updated_at ASC
+            """,
+            (product_id,),
+        ).fetchall()
+
+
+def price_summary(product_id):
+    rows = get_order_price_lines(product_id)
+
+    by_price = defaultdict(int)
+    by_spec_price = defaultdict(int)
+    total_amount = 0
+
+    for row in rows:
+        price = int(row["unit_price"])
+        qty = int(row["quantity"])
+        by_price[price] += qty
+        by_spec_price[(row["spec_name"], price)] += qty
+        total_amount += price * qty
+
+    return rows, by_price, by_spec_price, total_amount
+
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -137,6 +343,27 @@ def init_db():
             image_blob BLOB,
             image_mime TEXT,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS price_messages (
+            message_id TEXT PRIMARY KEY,
+            group_id TEXT NOT NULL,
+            image_message_id TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            label TEXT,
+            sender_user_id TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS order_price_lines (
+            product_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            display_name TEXT,
+            spec_name TEXT NOT NULL,
+            unit_price INTEGER NOT NULL,
+            quantity INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(product_id, user_id, spec_name, unit_price)
         );
 
         CREATE TABLE IF NOT EXISTS products (
@@ -1378,6 +1605,16 @@ def cancel_user_all(product_id, user_id):
                 user_id,
             ),
         )
+        conn.execute(
+            """
+            DELETE FROM order_price_lines
+            WHERE product_id=? AND user_id=?
+            """,
+            (
+                product_id,
+                user_id,
+            ),
+        )
 
 
 def cancel_user_spec(product_id, user_id, spec_name):
@@ -1385,6 +1622,17 @@ def cancel_user_spec(product_id, user_id, spec_name):
         conn.execute(
             """
             DELETE FROM order_items
+            WHERE product_id=? AND user_id=? AND spec_name=?
+            """,
+            (
+                product_id,
+                user_id,
+                spec_name,
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM order_price_lines
             WHERE product_id=? AND user_id=? AND spec_name=?
             """,
             (
@@ -1522,6 +1770,13 @@ def build_live_order_card(product, viewer_user_id):
         total_qty,
     ) = order_summary(product["id"])
 
+    (
+        price_rows,
+        by_price,
+        by_spec_price,
+        total_amount,
+    ) = price_summary(product["id"])
+
     body = [
         {
             "type": "text",
@@ -1533,6 +1788,17 @@ def build_live_order_card(product, viewer_user_id):
         {
             "type": "text",
             "text": f"👥 {people_count} 人｜📦 累計 {total_qty} 件",
+            "size": "sm",
+            "margin": "sm",
+            "weight": "bold",
+        },
+        {
+            "type": "text",
+            "text": (
+                f"💰 累計金額 ${total_amount}"
+                if total_amount
+                else "💰 尚未記錄價格"
+            ),
             "size": "sm",
             "margin": "sm",
             "weight": "bold",
@@ -1585,6 +1851,33 @@ def build_live_order_card(product, viewer_user_id):
             "color": "#777777",
             "margin": "sm",
         })
+
+    if by_spec_price:
+        body.extend([
+            {
+                "type": "separator",
+                "margin": "lg",
+            },
+            {
+                "type": "text",
+                "text": "價格累計",
+                "weight": "bold",
+                "size": "sm",
+                "margin": "lg",
+            },
+        ])
+
+        for (spec_name, price), qty in sorted(
+            by_spec_price.items(),
+            key=lambda x: (x[0][0], x[0][1]),
+        ):
+            body.append({
+                "type": "text",
+                "text": f"{spec_name}｜${price} × {qty}",
+                "size": "xs",
+                "margin": "sm",
+                "wrap": True,
+            })
 
     bubble = {
         "type": "bubble",
@@ -1658,6 +1951,13 @@ def build_final_product_bubble(product):
         total_qty,
     ) = order_summary(product["id"])
 
+    (
+        price_rows,
+        by_price,
+        by_spec_price,
+        total_amount,
+    ) = price_summary(product["id"])
+
     name_counts = Counter(
         (
             items[0]["display_name"]
@@ -1678,6 +1978,17 @@ def build_final_product_bubble(product):
             "type": "text",
             "text": f"👥 {people_count} 人｜📦 {total_qty} 件",
             "size": "sm",
+            "weight": "bold",
+            "margin": "sm",
+        },
+        {
+            "type": "text",
+            "text": (
+                f"💰 ${total_amount}"
+                if total_amount
+                else "💰 未記錄價格"
+            ),
+            "size": "xs",
             "weight": "bold",
             "margin": "sm",
         },
@@ -1789,6 +2100,33 @@ def build_final_product_bubble(product):
                         "flex": 0,
                     },
                 ],
+            })
+
+    if by_spec_price:
+        body.extend([
+            {
+                "type": "separator",
+                "margin": "md",
+            },
+            {
+                "type": "text",
+                "text": "價格",
+                "weight": "bold",
+                "size": "sm",
+                "margin": "md",
+            },
+        ])
+
+        for (spec_name, price), qty in sorted(
+            by_spec_price.items(),
+            key=lambda x: (x[0][0], x[0][1]),
+        ):
+            body.append({
+                "type": "text",
+                "text": f"{spec_name}｜${price} × {qty}",
+                "size": "xxs",
+                "margin": "xs",
+                "wrap": True,
             })
 
     bubble = {
@@ -2573,7 +2911,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Maison Lumi LINE Bot",
-        "version": "20-order-only-final-names",
+        "version": "21-price-thread-orders",
     })
 
 
@@ -3319,6 +3657,39 @@ def webhook():
         if not quoted_message_id:
             continue
 
+        # Boss / 小幫手回覆「商品照片」時，可以直接設定價格。
+        # 例如：199元、玲娜199元。
+        if can_query(user_id):
+            price_info = parse_price_text(
+                message.get("text", "")
+            )
+
+            pending_price_image = get_pending_image(
+                group_id,
+                quoted_message_id,
+            )
+            existing_price_product = get_product_by_image(
+                quoted_message_id
+            )
+
+            if (
+                price_info
+                and (
+                    pending_price_image
+                    or existing_price_product
+                )
+            ):
+                remember_price_message(
+                    message.get("id"),
+                    group_id,
+                    quoted_message_id,
+                    price_info["price"],
+                    price_info["label"],
+                    user_id,
+                )
+                # 設定價格不在群組回覆，保持安靜。
+                continue
+
         parsed = parse_order_text(
             message.get("text", "")
         )
@@ -3326,13 +3697,36 @@ def webhook():
         if not parsed:
             continue
 
+        # 客人可以直接回覆照片，也可以回覆 Boss / 小幫手的價格訊息。
+        price_message = get_price_message(
+            quoted_message_id
+        )
+
+        order_image_message_id = (
+            price_message["image_message_id"]
+            if price_message
+            else quoted_message_id
+        )
+
+        unit_price = (
+            int(price_message["price"])
+            if price_message
+            else None
+        )
+
+        price_label = (
+            (price_message["label"] or "").strip()
+            if price_message
+            else ""
+        )
+
         pending = get_pending_image(
             group_id,
-            quoted_message_id,
+            order_image_message_id,
         )
 
         product = get_product_by_image(
-            quoted_message_id
+            order_image_message_id
         )
 
         created_now = False
@@ -3383,18 +3777,39 @@ def webhook():
         if action == "ADD":
             for spec_name, qty in items:
                 if 1 <= qty <= 99:
+                    final_spec_name = spec_name
+
+                    # 客人只回 +1，而價格訊息有「玲娜199元」這種標籤時，
+                    # 自動把玲娜當成規格。
+                    if (
+                        price_label
+                        and spec_name == "單一規格"
+                    ):
+                        final_spec_name = normalize_spec(
+                            price_label
+                        )
+
                     add_order_item(
                         product["id"],
                         user_id,
                         display_name,
-                        spec_name,
+                        final_spec_name,
+                        qty,
+                    )
+
+                    add_order_price_line(
+                        product["id"],
+                        user_id,
+                        display_name,
+                        final_spec_name,
+                        unit_price,
                         qty,
                     )
 
             # 每一筆喊單後，都通知 Owner + 本場已加入的小幫手。
             # 通知卡顯示的是這個商品「目前累計數量」。
             product = get_product_by_image(
-                quoted_message_id
+                order_image_message_id
             )
             notify_live_order_update(
                 product
@@ -3409,7 +3824,7 @@ def webhook():
                 user_id,
             )
             product = get_product_by_image(
-                quoted_message_id
+                order_image_message_id
             )
             notify_live_order_update(
                 product
@@ -3425,7 +3840,7 @@ def webhook():
                 )
 
             product = get_product_by_image(
-                quoted_message_id
+                order_image_message_id
             )
             notify_live_order_update(
                 product
